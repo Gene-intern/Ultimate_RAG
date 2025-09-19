@@ -1,0 +1,58 @@
+# === 1) 基本設定 ===
+timezone_parse: "Asia/Taipei"
+
+stores:
+  zh: "indices/store_zh"
+  en: "indices/store_en"
+
+embedding:
+  zh: "BAAI/bge-large-zh-v1.5"
+  en: "BAAI/bge-large-en-v1.5"
+
+chunking:
+  pdf:
+    size: 500
+    overlap: 80
+  blog:
+    size: 500
+    overlap: 80
+  # 新：摘要切塊（取代 transcript 的 time-based 設定）
+  summary:
+    size: 900
+    overlap: 120
+
+# === 2) 權重（可選：覆蓋 DEFAULTS["weights"]）===
+weights:
+  default: 1.0
+  executive_summary: 1.3
+  conclusion: 1.2
+  qa: 1.1
+  mdna: 1.35
+  risk_factors: 1.25
+  market_risk: 1.15
+  financials: 1.10
+
+# === 3) 多模態（可選）===
+multimodal:
+  enable: true
+  table:
+    max_rows: 60
+  vlm:
+    enable: true
+    max_tokens: 180
+  vision:
+    enable: true
+    max_tokens: 300
+
+# === 4) Groq（可選，若你有用表格摘要/視覺抽取）===
+groq:
+  api_key_env: "GROQ_API_KEY"
+  text_model: "llama-3.3-70b"
+  vision_model: "llama-4-scout"   # 依你 Groq 控制台實際可用型號調整
+
+# === 5) 其他你自用的規則（保留不影響建置）===
+date_rules:
+  missing_year_default: current_year
+
+source_type_rules:
+  transcript_pdf_keywords: ["Transcript", "Q&A"]

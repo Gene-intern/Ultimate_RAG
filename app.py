@@ -1,5 +1,4 @@
 # -*- coding: utf-8 -*-
-
 import os, re, json, time, pickle
 from typing import List, Dict, Any, Tuple, Optional, Iterable, Set
 from datetime import datetime, timedelta
@@ -334,7 +333,7 @@ vectorstore_en = load_faiss_compat(STORE_EN, embed_en, index_name="index")
 GEN_MODEL_WHITELIST = [
     "llama-3.1-8b-instant",
     "llama-3.3-70b-versatile",
-    "openai/gpt-oss-120b",
+    #"openai/gpt-oss-120b",
     "openai/gpt-oss-20b",
 ]
 GEN_MODEL_DEFAULT = "llama-3.3-70b-versatile"
@@ -1456,7 +1455,6 @@ def resolve_symbol(t: str) -> Optional[str]:
             return sym
     return None
 
-
 def fetch_latest_close_via_chart(symbol: str, lookback_days: int = 7) -> Optional[dict]:
     """
     以 Yahoo v8 chart 在過去 lookback_days 天內尋找最近一筆「日線收盤」。
@@ -1659,9 +1657,6 @@ def format_news_markdown(news: List[dict]) -> str:
 def _prepare_stock_md(user_q: str, intents: set, companies: list) -> str:
     if "stock" not in intents:
         return ""
-
-    def _is_noise_qword(x: str) -> bool:
-        return bool(_QWORDS_RE.fullmatch((x or "").strip()))
 
     targets = (companies or [])[:]
     if not targets:
@@ -2445,7 +2440,7 @@ def bge_rank_and_pick(
     cos_scores: List[float],
     *,
     top_k: int = 5,
-    candidate_cap: int = 120,      # ← 預設也放寬，讓 BGE 有發揮空間
+    candidate_cap: int = 60,      # ← 預設也放寬，讓 BGE 有發揮空間
     clip_chars: int = 1100,
     batch_size: int = 32,
     type_scales: Dict[str, float] | None = None,
