@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 import os, re, json, time, pickle
-from typing import List, Dict, Any, Tuple, Optional, Iterable, Set
+from typing import List, Dict, Any, Tuple, Optional, Iterable, Set, Callable
 from datetime import datetime, timedelta
 
 import gradio as gr
@@ -24,7 +24,14 @@ from langchain_core.prompts import PromptTemplate
 
 # ===== 共用：請求器 + 迷你快取 =====
 _REQ_TIMEOUT = 7
-def _req_get(url: str, params: dict = None, headers: dict = None, timeout: float = _REQ_TIMEOUT, retries: int = 2, backoff: float = 0.6):
+def _req_get(
+    url: str,
+    params: dict = None,
+    headers: dict = None,
+    timeout: float = _REQ_TIMEOUT,
+    retries: int = 2,
+    backoff: float = 0.6,
+):
     base_headers = {
         "User-Agent": "Mozilla/5.0",
         "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
@@ -55,7 +62,6 @@ def _cache_get(key: str) -> Optional[Any]:
 
 def _cache_set(key: str, val: Any, ttl: int = 300) -> None:
     _CACHE[key] = {"val": val, "exp": time.time() + ttl}
-
 
 # =========================
 # FAISS 兼容載入
@@ -218,7 +224,12 @@ load_dotenv()
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 os.environ["GROQ_API_KEY"] = GROQ_API_KEY
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+# 優先使用 CUDA，其次使用 Apple Silicon 的 MPS，最後退回 CPU
+try:
+    _HAS_MPS = bool(getattr(torch.backends, "mps", None)) and torch.backends.mps.is_available()
+except Exception:
+    _HAS_MPS = False
+DEVICE = "cuda" if torch.cuda.is_available() else ("mps" if _HAS_MPS else "cpu")
 STORE_ZH = "indices/store_zh"
 STORE_EN = "indices/store_en"
 TZ_TW = tz.gettz("Asia/Taipei")
@@ -238,19 +249,24 @@ BGE_RERANK_MODEL = os.getenv("BGE_RERANK_MODEL", "BAAI/bge-reranker-large")
 bge_reranker = None
 if _HAS_BGE_RERANK:
     try:
-        # GPU 有就自動用 FP16；CPU 也可跑但會慢一些
-        bge_reranker = FlagReranker(
-            BGE_RERANK_MODEL,
-            use_fp16=(DEVICE == "cuda")
-        )
+        # 依裝置設定：CUDA 用 FP16；MPS/CPU 用 FP32，並嘗試顯式指定 device
+        rerank_kwargs = {"use_fp16": (DEVICE == "cuda")}
+        try:
+            # 新版 FlagReranker 支援 device 參數
+            rerank_kwargs["device"] = DEVICE
+            bge_reranker = FlagReranker(BGE_RERANK_MODEL, **rerank_kwargs)
+        except TypeError:
+            # 舊版不支援 device 參數，退回不帶 device
+            rerank_kwargs.pop("device", None)
+            bge_reranker = FlagReranker(BGE_RERANK_MODEL, **rerank_kwargs)
     except Exception as e:
-        print(f"[WARN] init bge reranker failed: {e}")
+        print(f"[WARN] init bge reranker failed (device={DEVICE}): {e}")
         _HAS_BGE_RERANK = False
 
 # ===== LLM 請求大小保護（避免 413 / 過長 prompt）=====
 # 字元粗估：英文約 4 chars/token，中文約 1–2 chars/token，這裡保守抓上限
 LLM_CTX_TOTAL_CHAR_SOFT = 7000   # 單次回答 context 總長度上限（軟性）
-LLM_CTX_PER_DOC_CHAR    = 1100   # 每段最多保留字元
+LLM_CTX_PER_DOC_CHAR    = 1000   # 每段最多保留字元
 LLM_CTX_MAX_DOCS        = 8      # 最多帶入的段落數
 
 YAHOO_FIRST = True  # True=Yahoo-first + 名單冷備援
@@ -283,7 +299,7 @@ def _symcache_flush():
     except Exception:
         pass
 
-def _symcache_get(name: str) -> Optional[str]:
+def _symcache_get_record(name: str) -> Optional[Dict[str, Any]]:
     if not name:
         return None
     if not _SYM_KV["map"]:
@@ -299,6 +315,13 @@ def _symcache_get(name: str) -> Optional[str]:
             _symcache_flush()
             return None
     except Exception:
+        return None
+    return rec
+
+
+def _symcache_get(name: str) -> Optional[str]:
+    rec = _symcache_get_record(name)
+    if not rec:
         return None
     return rec.get("symbol") or None
 
@@ -326,6 +349,26 @@ embed_en = HuggingFaceEmbeddings(
 vectorstore_zh = load_faiss_compat(STORE_ZH, embed_zh, index_name="index")
 vectorstore_en = load_faiss_compat(STORE_EN, embed_en, index_name="index")
 
+def _set_thread_env_if_unset(n_threads: int | None = None):
+    n = n_threads or (os.cpu_count() or 4)
+    # 只在未設定時賦值，避免覆寫你已經在 shell 設的參數
+    os.environ.setdefault("OMP_NUM_THREADS", str(n))
+    os.environ.setdefault("VECLIB_MAXIMUM_THREADS", str(n))  # macOS Accelerate/vecLib
+
+_set_thread_env_if_unset()
+
+# ---- 之後再 import faiss ----
+try:
+    import faiss
+    # 某些 macOS/arm64 的 wheel 沒有這些 API；所以要先判斷
+    if hasattr(faiss, "omp_set_num_threads"):
+        faiss.omp_set_num_threads(int(os.environ.get("OMP_NUM_THREADS", os.cpu_count() or 4)))
+    if hasattr(faiss, "omp_get_max_threads"):
+        print(f"[FAISS] max threads = {faiss.omp_get_max_threads()}")
+    else:
+        print("[FAISS] OpenMP control API not exposed; using env vars only.")
+except Exception as e:
+    print(f"[WARN] faiss thread setup failed: {e}")
 # =========================
 # LLMs
 # =========================
@@ -525,7 +568,13 @@ def clean_company_token(raw: str, *, original_text: str = "") -> Optional[str]:
     return s
 
 # --- B) 以 Yahoo Autocomplete / resolve_symbol 做「可攜式典範化」 ---
-def canonicalize_company_needles(token: str) -> Tuple[Optional[str], Set[str]]:
+def canonicalize_company_needles(
+    token: str,
+    *,
+    fast_mode: bool = False,
+    autoc_timeout: Optional[float] = None,
+    autoc_max_langs: Optional[int] = None,
+) -> Tuple[Optional[str], Set[str]]:
     """
     輸入：一個乾淨 token（可能是中文名/英文名/代號）
     輸出：(ticker or None, 需要匹配的 needles set[小寫])
@@ -545,7 +594,7 @@ def canonicalize_company_needles(token: str) -> Tuple[Optional[str], Set[str]]:
         return sym, needles
 
     # 1) 先嘗試解析出有效 ticker
-    sym = resolve_symbol(token)
+    sym = resolve_symbol(token, fast_mode=fast_mode, autoc_timeout=autoc_timeout, autoc_max_langs=autoc_max_langs)
     if sym:
         needles.add(sym.lower())
         import re
@@ -553,7 +602,13 @@ def canonicalize_company_needles(token: str) -> Tuple[Optional[str], Set[str]]:
         if digits:
             needles.add(digits)
         # 2) 從 autocomplete 抓顯示名稱（跨語系/跨區）
-        cands = yahoo_autoc_all(token, regions=("US","TW","HK"), langs=("zh-TW","zh-Hant-TW","en-US"))
+        cands = yahoo_autoc_all(
+            token,
+            regions=("US","TW","HK"),
+            langs=("zh-TW","zh-Hant-TW","en-US"),
+            timeout=autoc_timeout or 5.0,
+            max_langs=autoc_max_langs,
+        )
         for c in cands:
             name = (c.get("name") or "").strip()
             if name:
@@ -561,7 +616,13 @@ def canonicalize_company_needles(token: str) -> Tuple[Optional[str], Set[str]]:
                 name_norm = re.sub(r"\b(inc|inc\.|corp|corp\.|co|co\.|ltd|ltd\.|plc|sa|ag|nv|kk)\b\.?", "", name, flags=re.I)
                 needles.add(name_norm.lower())
         # 再補一次用 ticker 反查（避免 token 不是原始查詢語言）
-        cands2 = yahoo_autoc_all(sym, regions=("US","TW","HK"), langs=("zh-TW","en-US"))
+        cands2 = yahoo_autoc_all(
+            sym,
+            regions=("US","TW","HK"),
+            langs=("zh-TW","en-US"),
+            timeout=autoc_timeout or 5.0,
+            max_langs=autoc_max_langs,
+        )
         for c in cands2:
             if c.get("symbol") and c.get("symbol").lower() == sym.lower():
                 name = (c.get("name") or "").strip()
@@ -572,7 +633,15 @@ def canonicalize_company_needles(token: str) -> Tuple[Optional[str], Set[str]]:
 
     # 3) 還原失敗時，試著讓 LLM 翻成英文公司名再走一次
     en_name = to_english_company_name(token) or token
-    cands = yahoo_autoc_all(en_name, regions=("US","TW","HK"), langs=("en-US","zh-TW"))
+    if fast_mode:
+        return None, {token.lower()}
+    cands = yahoo_autoc_all(
+        en_name,
+        regions=("US","TW","HK"),
+        langs=("en-US","zh-TW"),
+        timeout=autoc_timeout or 5.0,
+        max_langs=autoc_max_langs,
+    )
     best = pick_best_yahoo_candidate(en_name, cands) if cands else None
     if best and is_valid_symbol(best):
         needles.add(best.lower())
@@ -942,7 +1011,7 @@ def yahoo_search_symbols_by_keyword(q: str, limit: int = 3) -> list[str]:
             return out
     return out
 
-def fetch_realtime_quote_batch(symbols: List[str], cache_ttl: int = 30) -> List[dict]:
+def fetch_realtime_quote_batch(symbols: List[str], cache_ttl: int = 30, timeout: Optional[float] = None) -> List[dict]:
     syms = [s for s in (symbols or []) if s]
     if not syms:
         return []
@@ -951,7 +1020,11 @@ def fetch_realtime_quote_batch(symbols: List[str], cache_ttl: int = 30) -> List[
     if cached is not None:
         return cached
 
-    r = _req_get("https://query1.finance.yahoo.com/v7/finance/quote", params={"symbols": ",".join(syms)})
+    r = _req_get(
+        "https://query1.finance.yahoo.com/v7/finance/quote",
+        params={"symbols": ",".join(syms)},
+        timeout=timeout or _REQ_TIMEOUT,
+    )
     out: List[dict] = []
     if not r:
         _cache_set(key, out, cache_ttl)
@@ -1088,8 +1161,6 @@ def _parse_jsonp(text: str) -> Optional[dict]:
     try: return json.loads(text)
     except Exception: return None
 
-# yahoo_symbol_autocomplete 已整合進 yahoo_autoc_all 與 _yahoo_autoc_collect
-
 def pick_best_yahoo_candidate(q: str, cands: List[dict]) -> Optional[str]:
     # 盡量用中文重疊 + 模糊度排出最可能；若全是英文名，也會回第一個有效候選
     qn = _normalize_name(q)
@@ -1165,13 +1236,21 @@ def yahoo_autoc_all(
     q: str,
     regions=("TW","US","HK"),
     langs=("zh-TW","zh-Hant-TW","zh-HK","en-US"),
-    timeout: float = 5.0
+    timeout: float = 5.0,
+    *,
+    max_langs: Optional[int] = None,
 ) -> List[dict]:
-    """同時嘗試 legacy 與新版 autoc，並輪詢多語系；整合去重。"""
+    """同時嘗試 legacy 與新版 autoc，並輪詢多語系；整合去重。
+
+    max_langs: 限制最多嘗試幾個語系，None 表示全部。
+    """
     if not (q or "").strip():
         return []
     out: List[dict] = []
-    for lang in langs:
+    lang_iter = list(langs)
+    if max_langs is not None:
+        lang_iter = lang_iter[:max_langs]
+    for lang in lang_iter:
         try:
             out += yahoo_autoc_legacy(q, regions=regions, lang=lang, timeout=timeout)
         except Exception:
@@ -1332,19 +1411,29 @@ def resolve_symbol_by_name(name: str) -> Optional[str]:
         return None
     
     # A) 先查持久快取（命中就回，避免重打多個端點）
-    hit = _symcache_get(q_raw)
-    if hit:
-        # hit 是否仍與當前資料一致？
-        cands = yahoo_autoc_all(q_raw, regions=("TW","US","HK"), langs=("zh-TW","en-US"))
-        syms = { (c.get("symbol") or "").upper() for c in cands }
-        _load_tw_lists()
-        norm = _normalize_name(q_raw)
-        tw_ok = hit.upper() in set((_TW_CACHE.get("by_name") or {}).get(norm, []))
-        if hit.upper() in syms or tw_ok:
-            return hit
-        # 不一致 → 清除快取並繼續走解析
-        _SYM_KV["map"].pop(_sym_norm_key(q_raw), None)
-        _symcache_flush()
+    hit_rec = _symcache_get_record(q_raw)
+    if hit_rec:
+        hit = (hit_rec.get("symbol") or "").strip()
+        if hit:
+            try:
+                age = max(0.0, time.time() - float(hit_rec.get("ts", 0)))
+            except Exception:
+                age = None
+            ttl_days = max(1, SYMBOL_MAP_TTL_DAYS)
+            revalidate_after = ttl_days * 43200  # 0.5 * 86400
+            if age is None or age <= revalidate_after:
+                return hit
+            cands = yahoo_autoc_all(q_raw, regions=("TW","US","HK"), langs=("zh-TW","en-US"))
+            syms = { (c.get("symbol") or "").upper() for c in cands }
+            _load_tw_lists()
+            norm = _normalize_name(q_raw)
+            tw_ok = hit.upper() in set((_TW_CACHE.get("by_name") or {}).get(norm, []))
+            if hit.upper() in syms or tw_ok:
+                _symcache_put(q_raw, hit)
+                return hit
+            # 不一致 → 清除快取並繼續走解析
+            _SYM_KV["map"].pop(_sym_norm_key(q_raw), None)
+            _symcache_flush()
 
     # B) Yahoo-first
     sym = _resolve_via_yahoo_pipeline(q_raw)
@@ -1409,7 +1498,13 @@ def resolve_symbol_by_name(name: str) -> Optional[str]:
     # D) 全失敗 → None
     return None
 
-def resolve_symbol(t: str) -> Optional[str]:
+def resolve_symbol(
+    t: str,
+    *,
+    fast_mode: bool = False,
+    autoc_timeout: Optional[float] = None,
+    autoc_max_langs: Optional[int] = None,
+) -> Optional[str]:
     if not (t or "").strip(): return None
     s = t.strip()
 
@@ -1428,16 +1523,19 @@ def resolve_symbol(t: str) -> Optional[str]:
         cands = yahoo_autoc_all(
             s,
             regions=("US","HK","TW"),
-            langs=("en-US","zh-TW","zh-Hant-TW")
+            langs=("en-US","zh-TW","zh-Hant-TW"),
+            timeout=autoc_timeout or 5.0,
+            max_langs=autoc_max_langs,
         )
         for c in cands:
             sym = c.get("symbol")
             if sym and _is_valid_symbol_cached(sym, lookback_days=30):
                 return sym
         # 3) 最後再用 LLM 猜測幾個 ticker 並驗證
-        for cand in guess_tickers_via_llm(s, max_n=6):
-            if _is_valid_symbol_cached(cand, lookback_days=30):
-                return cand
+        if not fast_mode:
+            for cand in guess_tickers_via_llm(s, max_n=6):
+                if _is_valid_symbol_cached(cand, lookback_days=30):
+                    return cand
     # 若以上都沒中，才真的回 None（落到函式最後的 return None）
     if re.fullmatch(r"\d{4}", s):
         for suf in (".TW",".TWO"):
@@ -1449,13 +1547,19 @@ def resolve_symbol(t: str) -> Optional[str]:
 
     # Autocomplete 備援（排名器）：統一使用 yahoo_autoc_all，並套用排名器
     for regs in (("TW",), ("US","HK")):
-        cands = yahoo_autoc_all(s, regions=regs, langs=("zh-TW","en-US"))
+        cands = yahoo_autoc_all(
+            s,
+            regions=regs,
+            langs=("zh-TW","en-US"),
+            timeout=autoc_timeout or 5.0,
+            max_langs=autoc_max_langs,
+        )
         sym = pick_best_yahoo_candidate(s, cands)
         if sym:
             return sym
     return None
 
-def fetch_latest_close_via_chart(symbol: str, lookback_days: int = 7) -> Optional[dict]:
+def fetch_latest_close_via_chart(symbol: str, lookback_days: int = 7, timeout: Optional[float] = None) -> Optional[dict]:
     """
     以 Yahoo v8 chart 在過去 lookback_days 天內尋找最近一筆「日線收盤」。
     用於 v7 quote 擋掉時的 fallback。
@@ -1468,7 +1572,8 @@ def fetch_latest_close_via_chart(symbol: str, lookback_days: int = 7) -> Optiona
 
         r = _req_get(
             f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}",
-            params={"period1": p1, "period2": p2, "interval": "1d", "includePrePost": "false"}
+            params={"period1": p1, "period2": p2, "interval": "1d", "includePrePost": "false"},
+            timeout=timeout or _REQ_TIMEOUT,
         )
         if not r:
             return None
@@ -1553,7 +1658,13 @@ def _display_name_for_symbol(symbol: str) -> Optional[str]:
             return nm
 
     # (C) Yahoo Autocomplete：用代號本身 & 純數字再比一次
-    for cand in yahoo_autoc_all(s, regions=("TW","US","HK"), langs=("zh-TW","en-US")):
+    for cand in yahoo_autoc_all(
+        s,
+        regions=("TW","US","HK"),
+        langs=("zh-TW","en-US"),
+        timeout=1.2,
+        max_langs=2,
+    ):
         if (cand.get("symbol") or "").upper() == s:
             nm = (cand.get("name") or "").strip()
             if nm:
@@ -1561,7 +1672,13 @@ def _display_name_for_symbol(symbol: str) -> Optional[str]:
     m = re.match(r"^(\d{4})\.(TW|TWO)$", s)
     if m:
         code_only = m.group(1)
-        for cand in yahoo_autoc_all(code_only, regions=("TW",), langs=("zh-TW","en-US")):
+        for cand in yahoo_autoc_all(
+            code_only,
+            regions=("TW",),
+            langs=("zh-TW","en-US"),
+            timeout=1.2,
+            max_langs=2,
+        ):
             if (cand.get("symbol") or "").upper() == s:
                 nm = (cand.get("name") or "").strip()
                 if nm:
@@ -1582,7 +1699,11 @@ def format_stock_reply(data: Optional[dict]) -> str:
 def fetch_yahoo_stock_news(symbol: Optional[str] = None, max_results: int = 5, company_kw: Optional[str] = None) -> List[dict]:
     def _req(url: str) -> Optional[BeautifulSoup]:
         try:
-            resp = _req_get(url, headers={"User-Agent":"Mozilla/5.0","Accept-Language":"zh-TW,zh;q=0.9,en;q=0.8"}, timeout=7)
+            resp = _req_get(
+                url,
+                headers={"User-Agent":"Mozilla/5.0","Accept-Language":"zh-TW,zh;q=0.9,en;q=0.8"},
+                timeout=3.0,
+            )
             return BeautifulSoup(resp.text, "html.parser") if resp else None
         except Exception:
             return None
@@ -1685,7 +1806,9 @@ def _prepare_stock_md(user_q: str, intents: set, companies: list) -> str:
 
     symbols = []
     for comp in seen_targets[:6]:
-        sym = resolve_symbol(comp)
+        sym = resolve_symbol(comp, fast_mode=True, autoc_timeout=1.0, autoc_max_langs=2)
+        if not sym:
+            sym = resolve_symbol(comp, fast_mode=False, autoc_timeout=3.0, autoc_max_langs=3)
         if sym:
             symbols = [sym]  # 只保留第一個解析成功的代號
             break
@@ -1713,13 +1836,13 @@ def _prepare_stock_md(user_q: str, intents: set, companies: list) -> str:
         lines = [format_stock_reply(fetch_stock_price_on_date(sym, date)) for sym in symbols]
     else:
         # 沒指定日期 → 先抓「即時價」，抓不到再退回最近收盤
-        qts = fetch_realtime_quote_batch(symbols)
+        qts = fetch_realtime_quote_batch(symbols, timeout=2.0)
         if qts:
             lines = [format_realtime_quotes(qts)]
         else:
             lines = []
             for sym in symbols:
-                data = fetch_latest_close_via_chart(sym, lookback_days=7)
+                data = fetch_latest_close_via_chart(sym, lookback_days=7, timeout=4.0)
                 lines.append(format_stock_reply(data))
 
     # 若仍無任何可用資訊，回覆統一訊息（避免誤導）
@@ -1734,7 +1857,11 @@ def _prepare_news_md(intents: set, companies: list, user_q: str = "") -> str:
     targets = (companies or [])[:]
     if not targets:
         targets = guess_companies_from_text(user_q, limit=1)
-    sym = resolve_symbol(targets[0]) if targets else None
+    sym = None
+    if targets:
+        sym = resolve_symbol(targets[0], fast_mode=True, autoc_timeout=1.0, autoc_max_langs=2)
+        if not sym:
+            sym = resolve_symbol(targets[0], fast_mode=False, autoc_timeout=3.0, autoc_max_langs=3)
     kw_for_filter = (targets[0] if targets and re.search(r"[\u4e00-\u9fff]", targets[0]) else None)
     news = fetch_yahoo_stock_news(sym, max_results=5, company_kw=kw_for_filter)
     return format_news_markdown(news)
@@ -1976,14 +2103,25 @@ def _dedup_norm_queries(qs: list[str]) -> list[str]:
         out.append(t)
     return out
 
-def _precompute_company_needles(companies: List[str] | None, user_q: str) -> set[str]:
+def _precompute_company_needles(
+    companies: List[str] | None,
+    user_q: str,
+    fetch_info: Optional[Callable[[str], Optional[Dict[str, Any]]]] = None,
+) -> set[str]:
     """公司過濾用的 needles 預先算一次，避免在 hit 迴圈反覆計算。"""
     nds = set()
     for tok in (companies or []):
+        if fetch_info is not None:
+            info = fetch_info(tok)
+            if not info:
+                continue
+            nds.update(info.get("needles") or ())
+            continue
         tok_clean = clean_company_token(tok, original_text=user_q)
         if not tok_clean:
             continue
-        _, needles = canonicalize_company_needles(tok_clean)
+        _sym, needles = canonicalize_company_needles(tok_clean)
+        needles = set(needles)
         needles.add(tok_clean.lower())
         nds.update(needles)
     return nds
@@ -2093,12 +2231,22 @@ def similarity_search_vectors(
     year_targets: set[int] | None = None,
     strict_year: bool = True,
     companies: List[str] | None = None,
+    lap: Optional[Callable[[str], None]] = None,   # ← 新增：外部可傳入計時器（例如 handle_question 的 _lap）
 ):
     """
     依語言把 query 分流，並強化「公司＋法說會/財報」種子。
     回傳：(docs, scores, zh_queries_used, en_queries_used)
     """
-    import re
+    import re, math
+
+    def _lap(name: str):
+        if lap:
+            try:
+                lap(name)
+            except Exception:
+                pass
+
+    _lap("retrieval:start")
 
     # --- 中文庫 queries (base) ---
     zh_queries = get_multi_queries(user_q, max_n=min(5, max(3, k)))
@@ -2109,6 +2257,7 @@ def similarity_search_vectors(
         en_queries = get_multi_queries_en(base_en, max_n=min(4, max(2, k // 2)))
     else:
         en_queries = get_multi_queries_en(user_q, max_n=min(5, max(3, k)))
+    _lap("retrieval:mk_base_queries")
 
     # 先準備 pin 容器（之後會以較大 cap 合併，避免被裁掉）
     zh_pins: List[str] = []
@@ -2116,12 +2265,15 @@ def similarity_search_vectors(
 
     # === 財報意圖：專用改寫 + 釘住英文主種子 / 中文補詞 ===
     if intents and ("financial_report" in intents):
+        _lap("retrieval:before_fin_rewrite")
         finance_plan = rewrite_finance_query(
             user_q,
             companies=companies,
             year_targets=year_targets,
             max_queries=max(8, k),
         )
+        _lap("retrieval:after_fin_rewrite")
+
         fin_en_seeds = list(dict.fromkeys(finance_plan.get("search_queries") or []))[: max(8, k)]
         if fin_en_seeds:
             en_pins += fin_en_seeds  # 先放進 pins，稍後合併
@@ -2137,13 +2289,127 @@ def similarity_search_vectors(
         for m in mets:
             zh_pins += ([f"{tk} {m}", f"{m} YoY"] if tk else [f"{m} 財報", f"{m} YoY"])
 
+    company_info_cache: Dict[str, Dict[str, Any]] = {}
+    COMPANY_RESOLVE_BUDGET = 3.0  # 秒，整體公司解析的時間上限
+    company_resolve_start = time.perf_counter()
+
+    def _make_company_info(token: str, sym: Optional[str], needles: Iterable[str], source: str) -> Dict[str, Any]:
+        base = (token or "").strip()
+        needles_set = set(n.lower() for n in needles if n)
+        if base:
+            needles_set.add(base.lower())
+        if sym:
+            needles_set.add(sym.lower())
+            digits = re.sub(r"\D", "", sym)
+            if digits:
+                needles_set.add(digits)
+        return {
+            "token": base,
+            "sym": sym,
+            "needles": frozenset(n for n in needles_set if n),
+            "source": source,
+        }
+
+    def _heuristic_company_info(tok: str, tok_clean: Optional[str]) -> Optional[Dict[str, Any]]:
+        basis = (tok_clean or tok or "").strip()
+        if not basis:
+            return None
+        up = basis.upper()
+
+        # 1) 符號快取命中 → 直接回傳
+        hit = _symcache_get(basis) or (_symcache_get(tok_clean) if tok_clean and tok_clean != basis else None)
+        if hit:
+            return _make_company_info(basis, hit, [basis, hit], source="cache")
+
+        # 2) 台股公開名單先行匹配
+        _load_tw_lists()
+        by_name = _TW_CACHE.get("by_name") or {}
+        by_code = _TW_CACHE.get("by_code") or {}
+        norm_basis = _normalize_name(basis)
+        tw_syms = list(by_name.get(norm_basis, []))
+        if not tw_syms and tok_clean and tok_clean != basis:
+            tw_syms = list(by_name.get(_normalize_name(tok_clean), []))
+        if tw_syms:
+            sym_pick = tw_syms[0]
+            needles = [basis, tok_clean or basis, sym_pick, sym_pick.split(".")[0]]
+            return _make_company_info(basis, sym_pick, needles, source="twlist")
+        sym_from_code = None
+        if up in by_code:
+            sym_from_code = up
+        elif up + ".TW" in by_code:
+            sym_from_code = up + ".TW"
+        elif up + ".TWO" in by_code:
+            sym_from_code = up + ".TWO"
+        if sym_from_code:
+            needles = [basis, tok_clean or basis, sym_from_code, sym_from_code.split(".")[0]]
+            return _make_company_info(basis, sym_from_code, needles, source="twlist")
+
+        # 3) 直接判斷是否為 ticker / 代碼，避免立即打外部 API
+        if re.fullmatch(r"[A-Za-z]{1,6}(?:\.[A-Za-z]{2,4})?", up):
+            return _make_company_info(basis, up, [up], source="fast")
+        if re.fullmatch(r"\d{4}(?:\.[A-Za-z]{2,4})?", up):
+            if "." in up:
+                return _make_company_info(basis, up, [up, up.split(".")[0]], source="fast")
+            tw_sym = up + ".TW"
+            needles = [tw_sym, up + ".TWO", up]
+            return _make_company_info(basis, tw_sym, needles, source="fast")
+
+        # 4) fallback：至少保留原字串作為 needle
+        return _make_company_info(basis, None, [basis], source="fast")
+
+    def _canonicalize_company_info(basis: str, seed: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        sym, needles = canonicalize_company_needles(
+            basis,
+            fast_mode=True,
+            autoc_timeout=1.0,
+            autoc_max_langs=2,
+        )
+        merged_needles: Set[str] = set(needles or [])
+        if seed:
+            merged_needles.update(seed.get("needles") or [])
+        merged_needles.add(basis.lower())
+        sym_final = sym or ((seed or {}).get("sym"))
+        return _make_company_info((seed or {}).get("token") or basis, sym_final, merged_needles, source="slow")
+
+    def _get_company_info(raw_token: str) -> Optional[Dict[str, Any]]:
+        tok = (raw_token or "").strip()
+        if not tok:
+            return None
+        tok_clean = clean_company_token(tok, original_text=user_q)
+        key = tok_clean or tok
+        cached = company_info_cache.get(key)
+        if cached:
+            return cached
+
+        info_fast = _heuristic_company_info(tok, tok_clean)
+        if info_fast:
+            company_info_cache[key] = info_fast
+        else:
+            info_fast = _make_company_info(tok_clean or tok, None, [tok_clean or tok], source="fast")
+            company_info_cache[key] = info_fast
+
+        if info_fast.get("sym"):
+            return info_fast
+
+        if (time.perf_counter() - company_resolve_start) > COMPANY_RESOLVE_BUDGET:
+            return info_fast
+
+        basis = (tok_clean or tok or "").strip()
+        if not basis:
+            return info_fast
+        info_slow = _canonicalize_company_info(basis, info_fast)
+        if info_slow:
+            company_info_cache[key] = info_slow
+            return info_slow
+        return info_fast
+
     # ====== 法說會題：強化查詢（公司名＋代碼） ======
     ec = is_earnings_call_query(user_q)
     if ec:
-        # 避免補 "" 成髒查詢
         targets = [c for c in (companies or [])[:1] if str(c).strip()]
         for tok in targets:
-            sym = resolve_symbol(tok) or ""
+            info = _get_company_info(tok)
+            sym = (info or {}).get("sym") or ""
             num = re.sub(r"\D", "", sym) if sym else ""  # 例如 3416
             # 中文 pins
             zh_pins += [
@@ -2167,13 +2433,16 @@ def similarity_search_vectors(
     comp_needles: Set[str] = set()
     resolved_syms: List[str] = []
     for tok in (companies or []):
-        tclean = clean_company_token(tok, original_text=user_q)
-        if not tclean:
+        info = _get_company_info(tok)
+        if not info:
             continue
-        sym, needles = canonicalize_company_needles(tclean)
-        comp_needles.update(needles)
+        comp_needles.update(info.get("needles") or ())
+        sym = info.get("sym")
         if sym:
             resolved_syms.append(sym)
+
+    if resolved_syms:
+        resolved_syms = list(dict.fromkeys(resolved_syms))
 
     if resolved_syms or comp_needles:
         boost_terms = list(sorted(comp_needles))[:6]
@@ -2190,12 +2459,15 @@ def similarity_search_vectors(
             en_pins += [f"{y} annual report", f"FY{y} earnings", f"FY{y} results", f"{y} 10-K"]
 
     # === 先合併 pins，再合併 alias；cap 放寬但會在最後去噪去重 ===
-    BIG_CAP = max(16, k + 8)
+    BIG_CAP = max(12, k + 6)
     zh_queries = _merge_cap(zh_pins, zh_queries, cap=BIG_CAP)
     en_queries = _merge_cap(en_pins, en_queries, cap=BIG_CAP)
+    _lap("retrieval:merged_pins_base")
 
     # === 別名／同義詞擴展（補 recall，不壓前面的 pins） ===
+    _lap("retrieval:before_alias_expand")
     aliases = expand_aliases_via_llm(user_q, max_terms=12)
+    _lap("retrieval:after_alias_expand")
 
     # 若有年份明確意圖，就關閉「最新/latest」模板，避免偏置
     def _mk_zh(seed: str) -> list[str]:
@@ -2226,8 +2498,9 @@ def similarity_search_vectors(
     # 查詢去噪去重（非常重要，避免發太多冗餘 RPC）
     zh_queries = _dedup_norm_queries(zh_queries)
     en_queries = _dedup_norm_queries(en_queries)
+    _lap("retrieval:queries_ready")
 
-    # —— 新增：分數標準化工具 —— 
+    # —— 分數標準化工具 —— 
     def _zscore_norm(scores: list[float]) -> list[float]:
         if not scores:
             return scores
@@ -2240,7 +2513,7 @@ def similarity_search_vectors(
         # 將 z 分數壓回 0~1（sigmoid），避免負值難以直觀混分
         return [1.0 / (1.0 + math.exp(- (s - mu) / std)) for s in scores]
 
-    # —— 新增：收集 hits（保留 query/順位以便除錯或做多樣性） ——
+    # —— 收集 hits（保留 query/順位以便除錯或做多樣性） ——
     def _collect_hits(vs, queries: list[str], k: int):
         """
         回傳 [(doc, raw_score, q_index, rank_in_q), ...]
@@ -2255,15 +2528,22 @@ def similarity_search_vectors(
 
     # ===== 檢索（加入中/英庫內部標準化）=====
     pool, seen = [], set()
-    company_needles = _precompute_company_needles(companies, user_q)
+    company_needles = _precompute_company_needles(companies, user_q, fetch_info=_get_company_info)
 
     # 1) 先各自收集 hits
+    _lap("retrieval:zh_search_start")
     zh_hits = _collect_hits(vectorstore_zh, zh_queries, k)  # [(d, raw_s, qi, ri), ...]
-    en_hits = _collect_hits(vectorstore_en, en_queries, k)
+    _lap("retrieval:zh_search_done")
 
-    # 2) 各庫內部 min–max 標準化，避免標度不一致
+    _lap("retrieval:en_search_start")
+    en_hits = _collect_hits(vectorstore_en, en_queries, k)
+    _lap("retrieval:en_search_done")
+
+    # 2) 各庫內部標準化，避免標度不一致
+    _lap("retrieval:score_norm_start")
     zh_scores_norm = _zscore_norm([h[1] for h in zh_hits])
     en_scores_norm = _zscore_norm([h[1] for h in en_hits])
+    _lap("retrieval:score_norm_done")
 
     # 3) 封裝一個將（命中文件, 標準化分）推入 pool 的步驟（先過濾、後加權）
     def _push_after_filter(d, base_score: float):
@@ -2298,14 +2578,16 @@ def similarity_search_vectors(
         pool.append((d, float(score2)))
 
     # 4) 將中/英庫標準化後的分數套過濾與加權邏輯推入 pool
+    _lap("retrieval:pooling_start")
     for (d, _raw, _qi, _ri), s in zip(zh_hits, zh_scores_norm):
         _push_after_filter(d, s)
-
     for (d, _raw, _qi, _ri), s in zip(en_hits, en_scores_norm):
         _push_after_filter(d, s)
+    _lap("retrieval:pooling_done")
 
     # 5) 若完全召回為空：metadata 回退（限額）
     if not pool and ec and companies:
+        _lap("retrieval:metadata_fallback_start")
         try:
             needles = {c.lower() for c in companies}
             more, cap, cnt = [], 50, 0
@@ -2327,13 +2609,16 @@ def similarity_search_vectors(
             pool.extend(more)
         except Exception:
             pass
+        _lap("retrieval:metadata_fallback_done")
 
     # 6) 排序 & 回傳
     if not pool:
+        _lap("retrieval:done_empty")
         return ([], [], zh_queries, en_queries)
 
     pool.sort(key=lambda x: x[1], reverse=True)
     docs, scores = zip(*pool)
+    _lap("retrieval:done_ok")
     return (list(docs), list(scores), zh_queries, en_queries)
 
 # =========================
@@ -2367,7 +2652,7 @@ rerank_prompt = PromptTemplate.from_template(
 """
 )
 
-def llm_rerank(question: str, docs: List[Any], cos_scores: List[float], candidate_cap: int = 8, clip_chars: int = 700) -> List[float]:
+def llm_rerank(question: str, docs: List[Any], cos_scores: List[float], candidate_cap: int = 8, clip_chars: int = 900) -> List[float]:
     if not docs: return []
     order = np.argsort(np.asarray(cos_scores, dtype=float))[::-1]
     keep = [int(i) for i in order[:min(candidate_cap, len(docs))]]
@@ -2440,8 +2725,8 @@ def bge_rank_and_pick(
     cos_scores: List[float],
     *,
     top_k: int = 5,
-    candidate_cap: int = 60,      # ← 預設也放寬，讓 BGE 有發揮空間
-    clip_chars: int = 1100,
+    candidate_cap: int = 30,      # ← 預設也放寬，讓 BGE 有發揮空間
+    clip_chars: int = 900,
     batch_size: int = 32,
     type_scales: Dict[str, float] | None = None,
     recency_boost: bool = False,
@@ -2992,7 +3277,7 @@ def is_summary_query(text: str) -> bool:
     hit = sum(1 for m in metrics if m in text)
     return hit >= 3
 
-def synthesize_answer(question: str, picked_docs: List[Any], mode: str = "初學者模式", intents: Optional[List[str]] = None) -> str:
+def synthesize_answer(question: str, picked_docs: List[Any], mode: str = "初學者模式", intents: Optional[List[str]] = None, custom_prompt: str = "") -> str:
     if not picked_docs:
         return "目前找不到可直接回答的內容。", "", {}
 
@@ -3001,17 +3286,27 @@ def synthesize_answer(question: str, picked_docs: List[Any], mode: str = "初學
 
     # 優先：財報專用（精簡條列版）
     intents = intents or []
-    if "financial_report" in intents:
-        tmpl = financial_report_compact_prompt
-        body = llm.invoke(tmpl.format(context=ctx, question=question)).content.strip()
-    else:
-        if "專家" in (mode or ""):
-            tmpl = expert_answer_prompt
-        elif "初學" in (mode or ""):
-            tmpl = beginner_answer_prompt
+    use_custom = bool(custom_prompt and ("客製" in (mode or "")))
+    if use_custom:
+        cp = (custom_prompt or "").strip()
+        # 客製化：若包含占位符則 format，否則把 context 與 question 接在指令後
+        if ("{context}" in cp) or ("{question}" in cp):
+            prompt_text = cp.format(context=ctx, question=question)
         else:
-            tmpl = answer_prompt
-        body = llm.invoke(tmpl.format(context=ctx, question=question)).content.strip()
+            prompt_text = f"{cp}\n---------\n{ctx}\n---------\n問題：{question}"
+        body = llm.invoke(prompt_text).content.strip()
+    else:
+        if "financial_report" in intents:
+            tmpl = financial_report_compact_prompt
+            body = llm.invoke(tmpl.format(context=ctx, question=question)).content.strip()
+        else:
+            if "專家" in (mode or ""):
+                tmpl = expert_answer_prompt
+            elif "初學" in (mode or ""):
+                tmpl = beginner_answer_prompt
+            else:
+                tmpl = answer_prompt
+            body = llm.invoke(tmpl.format(context=ctx, question=question)).content.strip()
 
     # 於每一條列行尾追加來源連結（依 S 標籤）
     body = annotate_bullet_sources(body, src_map)
@@ -3527,6 +3822,7 @@ def run_month_digest(
     max_docs: int = 12,
     candidates: Optional[List[Any]] = None,
     mode: str = "初學者模式",
+    custom_prompt: str = "",
 ) -> Tuple[str, str]:
     """
     產生「整月摘要」。回傳 (answer_md, sources_md)
@@ -3593,20 +3889,31 @@ def run_month_digest(
     blocks = [_clip_text(b, CLIP_PER_BLOCK) for b in blocks]
     batches = _batch_by_char_limit(blocks, limit=BATCH_CHAR_LIMIT)
 
-    # 5) 依 mode 選用 prompt
-    if "專家" in (mode or ""):
-        tmpl = month_digest_prompt_pro
-    elif "初學" in (mode or ""):
-        tmpl = month_digest_prompt_beg
-    else:
-        tmpl = month_digest_prompt  # 一般模式：只有月份總結（無名詞小辭典）
+    # 5) 依 mode 選用 prompt（客製化模式使用自訂 prompt）
+    use_custom = bool(custom_prompt and ("客製" in (mode or "")))
+    if not use_custom:
+        if "專家" in (mode or ""):
+            tmpl = month_digest_prompt_pro
+        elif "初學" in (mode or ""):
+            tmpl = month_digest_prompt_beg
+        else:
+            tmpl = month_digest_prompt  # 一般模式：只有月份總結（無名詞小辭典）
 
     # 6) 分批丟給 LLM，再把結果接起來
     answers: List[str] = []
     for bs in batches:
         part_ctx = SEP.join(bs)
         try:
-            resp = llm.invoke(tmpl.format(context=part_ctx, question=user_input)).content.strip()
+            if use_custom:
+                # 客製化：若包含占位符則 format，否則把 context 與 question 接在指令後
+                cp = (custom_prompt or "").strip()
+                if ("{context}" in cp) or ("{question}" in cp):
+                    prompt_text = cp.format(context=part_ctx, question=user_input)
+                else:
+                    prompt_text = f"{cp}\n---------\n{part_ctx}\n---------\n問題：{user_input}"
+                resp = llm.invoke(prompt_text).content.strip()
+            else:
+                resp = llm.invoke(tmpl.format(context=part_ctx, question=user_input)).content.strip()
         except Exception as e:
             resp = f"（本批摘要失敗：{e}）"
         answers.append(resp)
@@ -3624,19 +3931,45 @@ def run_month_digest(
 # =========================
 def handle_question(user_q: str, top_n: int, top_k: int,
                     blog_scale: float, pdf_scale: float, research_scale: float, summary_scale: float,
-                    filing_scale: float,   
-                    mode: str, gen_model_choice: str):
+                    filing_scale: float,
+                    mode: str, gen_model_choice: str,
+                    custom_prompt: str = ""):
+    # 計時工具（毫秒）
+    t0 = time.perf_counter()
+    t_prev = t0
+    times: dict[str, float] = {}
+    def _lap(name: str):
+        nonlocal t_prev
+        now = time.perf_counter()
+        times[name] = now - t_prev
+        t_prev = now
+    def _fmt_times(order: list[str]) -> str:
+        parts = []
+        for k in order:
+            if k in times:
+                parts.append(f"{k}:{int(times[k]*1000)}ms")
+        parts.append(f"total:{int((time.perf_counter()-t0)*1000)}ms")
+        return "[TIMES] " + " | ".join(parts)
+
+    # 類別倍率顯示工具（固定順序、避免 KeyError）
+    def _fmt_type_scales(ts: dict) -> str:
+        order = ("blog", "pdf", "research", "transcript", "filing", "other")
+        return ", ".join(f"{key}:{ts.get(key, 1.0):.2f}" for key in order)
+
     user_q = (user_q or "").strip()
     if not user_q:
         return gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), "—", None
+
     effective_gen = set_gen_llm(gen_model_choice)
+    _lap("set_llm")
+
     # === 類別倍率 ===
     type_scales = {
         "blog":       float(blog_scale),
         "pdf":        float(pdf_scale),
         "research":   float(research_scale),
         "transcript": float(summary_scale),
-        "filing":     float(filing_scale),   
+        "filing":     float(filing_scale),
         "other":      1.0,
     }
 
@@ -3645,6 +3978,7 @@ def handle_question(user_q: str, top_n: int, top_k: int,
     intents, companies = classify_intents_and_companies(user_q)
     requested_years = extract_report_year_targets(user_q) if ("financial_report" in intents) else set()
     wants_latest = bool(re.search(r"(最新|最近|近況|未來)", user_q))
+    _lap("parse")
 
     if ("concept" in set(intents)) or ("industry" in set(intents)):
         type_scales = {**type_scales}
@@ -3665,19 +3999,14 @@ def handle_question(user_q: str, top_n: int, top_k: int,
     news_md_pref = _prepare_news_md(set(intents), companies, user_q)
     if news_md_pref:
         lead_parts.append("📰 **即時新聞**\n" + news_md_pref)
+    _lap("yahoo_blocks")
 
-    # ===（NEW）Yahoo-only 短路：若偵測到股價/新聞意圖，且已成功組出 Yahoo 區塊 → 直接回傳，不進月份/RAG ===
+    # === Yahoo-only 短路 ===
     if (("stock" in intents) or ("news" in intents)) and lead_parts:
         answer_md = "\n\n".join(lead_parts).strip()
-
-        # 查詢/除錯區域：標明未進 RAG，避免誤導
         queries_md = "（此問題被判定為『股價/新聞』，已直接使用 Yahoo 資訊）"
-        debug_txt = "[SHORT-CIRCUIT] yahoo_only"
-
-        # 下拉延伸問題：保留 placeholder 即可（或你也能改成空）
+        debug_txt = "[SHORT-CIRCUIT] yahoo_only\n" + _fmt_times(["set_llm", "parse", "yahoo_blocks"])
         dd_choices = [FOLLOWUP_PLACEHOLDER]
-
-        # meta：給前端/記錄用
         meta = {
             "type": "yahoo_only",
             "question": user_q,
@@ -3685,22 +4014,21 @@ def handle_question(user_q: str, top_n: int, top_k: int,
             "companies": companies,
             "picked": 0,
         }
-
         return (
-            answer_md,                 # 主答案：只有 Yahoo 區塊
-            "",                        # sources/context：留空，不顯示 RAG 來源
-            queries_md,                # 查詢顯示：標註為 yahoo_only
-            debug_txt,                 # 除錯資訊
+            answer_md,
+            "",
+            queries_md,
+            debug_txt,
             gr.update(choices=dd_choices, value=dd_choices[0]),
-            "—",                       # 右上角狀態列/提醒
-            meta,                      # 後設資訊
+            "—",
+            meta,
         )
 
     # === (A) 月份模式 ===
     if is_month and month_rng:
         start, end = month_rng
 
-        # 先用一般檢索找出與主題相關的候選，再過濾到該月
+        # 檢索 + 詳細打點
         docs, cos_scores, zh_qs, en_qs = similarity_search_vectors(
             user_q,
             k=max(12, top_n),
@@ -3709,9 +4037,12 @@ def handle_question(user_q: str, top_n: int, top_k: int,
             intents=set(intents),
             year_targets=requested_years,
             strict_year=True,
-            companies=companies,  # 重要：帶公司 → filing 過濾才會成立
+            companies=companies,
+            lap=_lap,  # ← 傳入計時 callback
         )
+        _lap("retrieval")  # 外層收尾
 
+        # 該月過濾
         month_docs, cos_masked = [], []
         for d, sc in zip(docs, cos_scores):
             dt = get_doc_date_dt(d.metadata or {})
@@ -3720,30 +4051,31 @@ def handle_question(user_q: str, top_n: int, top_k: int,
                 if start <= dt_naive < end:
                     month_docs.append(d)
                     cos_masked.append(sc)
+        _lap("month_filter")
 
         if month_docs:
-            # 有符合該月的候選 → 做月份總結
+            # 產出月份總結
             answer_md, sources_md = run_month_digest(
                 user_input=user_q,
                 start=start, end=end,
                 per_doc_k=1, max_docs=min(12, max(6, top_n)),
                 candidates=month_docs,
                 mode=mode or "一般模式",
+                custom_prompt=custom_prompt,
             )
-            # 需求：若包含股價/新聞意圖，先回傳該資訊，再接月份總結
             if lead_parts:
                 answer_md = ("\n\n".join(lead_parts + [answer_md])).strip()
 
-            # 顯示查詢改寫
+            # 查詢顯示
             def _fmt_queries(zh, en):
                 z = "\n".join(f"- {q}" for q in (zh or [])[:8]) or "（無）"
                 e = "\n".join(f"- {q}" for q in (en or [])[:8]) or "（無）"
                 return f"**中文查詢**\n{z}\n\n**英文查詢**\n{e}"
             queries_md = _fmt_queries(zh_qs, en_qs)
+            _lap("fmt_queries")
 
-            # Debug 區
-            # 粗略統計該月候選是否含數字/營收/EPS/毛利率關鍵詞
-            metric_counts = {"has_num":0, "revenue":0, "eps":0, "gm":0}
+            # Debug
+            metric_counts = {"has_num": 0, "revenue": 0, "eps": 0, "gm": 0}
             for d in month_docs:
                 f = _metric_flags(d.page_content or "")
                 for k in metric_counts:
@@ -3752,14 +4084,30 @@ def handle_question(user_q: str, top_n: int, top_k: int,
             debug_txt = (
                 f"[MODE] month_digest {start.strftime('%Y-%m')} ~ {end.strftime('%Y-%m-%d')}\n"
                 f"[INTENTS] {', '.join(intents) if intents else '—'} | [COMPANIES] {', '.join(companies) if companies else '—'}\n"
-                "[TYPES] " + ", ".join(f"{k}:{type_scales[k]:.2f}" for k in ["blog","pdf","research","transcript","filing","other"]) + "\n"
-                f"[CANDIDATES] {len(month_docs)} | num:{metric_counts['has_num']} rev:{metric_counts['revenue']} eps:{metric_counts['eps']} gm:{metric_counts['gm']}"
+                "[TYPES] " + _fmt_type_scales(type_scales) + "\n"
+                f"[CANDIDATES] {len(month_docs)} | num:{metric_counts['has_num']} rev:{metric_counts['revenue']} eps:{metric_counts['eps']} gm:{metric_counts['gm']}\n"
+                + _fmt_times([
+                    "set_llm", "parse", "yahoo_blocks",
+                    # 內部檢索節點
+                    "retrieval:start",
+                    "retrieval:mk_base_queries",
+                    "retrieval:before_fin_rewrite", "retrieval:after_fin_rewrite",
+                    "retrieval:merged_pins_base",
+                    "retrieval:before_alias_expand", "retrieval:after_alias_expand",
+                    "retrieval:queries_ready",
+                    "retrieval:zh_search_start", "retrieval:zh_search_done",
+                    "retrieval:en_search_start", "retrieval:en_search_done",
+                    "retrieval:score_norm_start", "retrieval:score_norm_done",
+                    "retrieval:pooling_start", "retrieval:pooling_done",
+                    "retrieval:metadata_fallback_start", "retrieval:metadata_fallback_done",
+                    "retrieval:done_ok", "retrieval:done_empty",
+                    # 外層
+                    "retrieval", "month_filter", "fmt_queries"
+                ])
             )
 
-            # 延伸問題
             followups = make_followups(user_q, answer_md, n_min=3, n_max=5)
             dd_choices = [FOLLOWUP_PLACEHOLDER] + followups
-
             month_state_msg = f"🗓️ 已整理 {start.strftime('%Y-%m')}：{len(month_docs)} 份文件"
             meta = {
                 "type": "month_digest",
@@ -3776,11 +4124,10 @@ def handle_question(user_q: str, top_n: int, top_k: int,
                 debug_txt,
                 gr.update(choices=dd_choices, value=dd_choices[0]),
                 month_state_msg,
-                meta,   # 注意：不要 json.dumps
+                meta,
             )
-
         else:
-            # 當月沒有與主題相關的段落 → 做實用 fallback
+            # 月份無候選 → fallback
             parts = []
             stock_md = _prepare_stock_md(user_q, intents, companies)
             if stock_md:
@@ -3796,7 +4143,23 @@ def handle_question(user_q: str, top_n: int, top_k: int,
                 "[DEBUG] month_pending | " + start.strftime("%Y-%m") +
                 f"\n[INTENTS] {', '.join(intents) if intents else '—'}"
                 f" | [COMPANIES] {', '.join(companies) if companies else '—'}"
-                "\n[TYPES] " + ", ".join(f"{k}:{type_scales[k]:.2f}" for k in ["blog","pdf","research","transcript","filing","other"])
+                "\n[TYPES] " + _fmt_type_scales(type_scales) +
+                "\n" + _fmt_times([
+                    "set_llm", "parse", "yahoo_blocks",
+                    "retrieval:start",
+                    "retrieval:mk_base_queries",
+                    "retrieval:before_fin_rewrite", "retrieval:after_fin_rewrite",
+                    "retrieval:merged_pins_base",
+                    "retrieval:before_alias_expand", "retrieval:after_alias_expand",
+                    "retrieval:queries_ready",
+                    "retrieval:zh_search_start", "retrieval:zh_search_done",
+                    "retrieval:en_search_start", "retrieval:en_search_done",
+                    "retrieval:score_norm_start", "retrieval:score_norm_done",
+                    "retrieval:pooling_start", "retrieval:pooling_done",
+                    "retrieval:metadata_fallback_start", "retrieval:metadata_fallback_done",
+                    "retrieval:done_ok", "retrieval:done_empty",
+                    "retrieval"
+                ])
             )
             followups = [SPECIAL_OVERVIEW_LABEL] + make_followups(user_q, final_out, n_min=3, n_max=5)
             dd_choices = [FOLLOWUP_PLACEHOLDER] + (followups or [])
@@ -3820,7 +4183,6 @@ def handle_question(user_q: str, top_n: int, top_k: int,
                 meta,
             )
 
-
     # === (B) 一般模式（RAG） ===
     docs, cos_scores, zh_qs, en_qs = similarity_search_vectors(
         user_q,
@@ -3831,7 +4193,9 @@ def handle_question(user_q: str, top_n: int, top_k: int,
         year_targets=requested_years,
         strict_year=True,
         companies=companies,
+        lap=_lap,  # ← 傳入計時 callback
     )
+    _lap("retrieval")
 
     if not docs:
         # 沒有候選：給股票/新聞 fallback
@@ -3848,11 +4212,28 @@ def handle_question(user_q: str, top_n: int, top_k: int,
         zh_view = "\n".join(f"- {q}" for q in (zh_qs or [])[:8]) or "（無）"
         en_view = "\n".join(f"- {q}" for q in (en_qs or [])[:8]) or "（無）"
         queries_md = f"**中文查詢**\n{zh_view}\n\n**英文查詢**\n{en_view}"
+        _lap("fmt_queries")
 
         debug_txt = (
             "[DEBUG] no_docs\n"
             f"[INTENTS] {', '.join(intents) if intents else '—'} | [COMPANIES] {', '.join(companies) if companies else '—'}\n"
-            "[TYPES] " + ", ".join(f"{k}:{type_scales[k]:.2f}" for k in ["blog","pdf","research","transcript","filing","other"])
+            "[TYPES] " + _fmt_type_scales(type_scales) + "\n"
+            + _fmt_times([
+                "set_llm", "parse", "yahoo_blocks",
+                "retrieval:start",
+                "retrieval:mk_base_queries",
+                "retrieval:before_fin_rewrite", "retrieval:after_fin_rewrite",
+                "retrieval:merged_pins_base",
+                "retrieval:before_alias_expand", "retrieval:after_alias_expand",
+                "retrieval:queries_ready",
+                "retrieval:zh_search_start", "retrieval:zh_search_done",
+                "retrieval:en_search_start", "retrieval:en_search_done",
+                "retrieval:score_norm_start", "retrieval:score_norm_done",
+                "retrieval:pooling_start", "retrieval:pooling_done",
+                "retrieval:metadata_fallback_start", "retrieval:metadata_fallback_done",
+                "retrieval:done_ok", "retrieval:done_empty",
+                "retrieval", "fmt_queries"
+            ])
         )
         followups = make_followups(user_q, answer_md, n_min=3, n_max=5)
         dd_choices = [FOLLOWUP_PLACEHOLDER] + followups
@@ -3875,22 +4256,25 @@ def handle_question(user_q: str, top_n: int, top_k: int,
     picked_docs, final_scores, dbg = bge_rank_and_pick(
         user_q, docs, cos_scores,
         top_k=top_k,
-        candidate_cap=max(60, top_n+20),   # 可按你的索引規模微調（60~150）
-        clip_chars=LLM_CTX_PER_DOC_CHAR,   # 盡量沿用你的每段上限
+        candidate_cap=max(36, top_n+12),   # 可按索引規模微調
+        clip_chars=900,                     # 依原設定
         batch_size=32,
         type_scales=type_scales,
         recency_boost=wants_latest,
         recency_half_life=45,
     )
+    _lap("rerank")
 
-    # 產生答案（依財報/一般/初學者/專家切換）
+    # 產生答案
     answer_md, ctx_full, src_map = synthesize_answer(
         question=user_q,
         picked_docs=picked_docs,
         mode=mode or "一般模式",
         intents=intents,
+        custom_prompt=custom_prompt,
     )
-    # 需求：若包含股價/新聞意圖，先回傳該資訊，再接 RAG 回答
+    _lap("answer")
+
     if lead_parts:
         answer_md = ("\n\n".join(lead_parts + [answer_md])).strip()
     sources_md = render_sources_md(src_map)
@@ -3899,16 +4283,33 @@ def handle_question(user_q: str, top_n: int, top_k: int,
     zh_view = "\n".join(f"- {q}" for q in (zh_qs or [])[:8]) or "（無）"
     en_view = "\n".join(f"- {q}" for q in (en_qs or [])[:8]) or "（無）"
     queries_md = f"**中文查詢**\n{zh_view}\n\n**英文查詢**\n{en_view}"
+    _lap("fmt_queries")
 
-    # Debug 區
     debug_txt = (
-        "[MODE] normal_rag (BGE reranker)\n"  
+        "[MODE] normal_rag (BGE reranker)\n"
         f"[INTENTS] {', '.join(intents) if intents else '—'} | [COMPANIES] {', '.join(companies) if companies else '—'} | wants_latest={wants_latest}\n"
-        "[TYPES] " + ", ".join(f"{k}:{type_scales[k]:.2f}" for k in ["blog","pdf","research","transcript","filing","other"]) + "\n"
-        f"{dbg}"
+        "[TYPES] " + _fmt_type_scales(type_scales) + "\n"
+        f"{dbg}\n" +
+        _fmt_times([
+            "set_llm", "parse", "yahoo_blocks",
+            # 內部檢索節點
+            "retrieval:start",
+            "retrieval:mk_base_queries",
+            "retrieval:before_fin_rewrite", "retrieval:after_fin_rewrite",
+            "retrieval:merged_pins_base",
+            "retrieval:before_alias_expand", "retrieval:after_alias_expand",
+            "retrieval:queries_ready",
+            "retrieval:zh_search_start", "retrieval:zh_search_done",
+            "retrieval:en_search_start", "retrieval:en_search_done",
+            "retrieval:score_norm_start", "retrieval:score_norm_done",
+            "retrieval:pooling_start", "retrieval:pooling_done",
+            "retrieval:metadata_fallback_start", "retrieval:metadata_fallback_done",
+            "retrieval:done_ok", "retrieval:done_empty",
+            # 外層
+            "retrieval", "rerank", "answer", "fmt_queries"
+        ])
     )
 
-    # 延伸問題
     followups = make_followups(user_q, answer_md, n_min=3, n_max=5)
     dd_choices = [FOLLOWUP_PLACEHOLDER] + followups
 
@@ -3929,7 +4330,7 @@ def handle_question(user_q: str, top_n: int, top_k: int,
         meta,
     )
 
-def on_followup_change(v, n, k, sb, sp, sr, st, sf, mode, model_name, meta):
+def on_followup_change(v, n, k, sb, sp, sr, st, sf, mode, model_name, meta, custom_prompt=""):
     DEFAULT_OPT = FOLLOWUP_PLACEHOLDER
 
     # 可能是字串就嘗試 parse
@@ -3971,7 +4372,7 @@ def on_followup_change(v, n, k, sb, sp, sr, st, sf, mode, model_name, meta):
             pass
         month_question = f"{start.strftime('%Y-%m')} 月份總結"
         ans_text, ctx_full = run_month_digest(
-            month_question, start, end, per_doc_k=1, max_docs=12, candidates=None, mode=mode
+            month_question, start, end, per_doc_k=1, max_docs=12, candidates=None, mode=mode, custom_prompt=custom_prompt
         )
 
         # 產生新的延伸問題清單
@@ -4007,6 +4408,13 @@ def on_followup_change(v, n, k, sb, sp, sr, st, sf, mode, model_name, meta):
 with gr.Blocks(title="RAG (zh/en) + LLM rerank + Yahoo 新聞\當日股價 + 部落格月份重點整理") as demo:
     gr.Markdown("## 🔎 RAG ＋🔁 BGE Rerank＋📈/📰 Yahoo＋🗓️ 月份自動偵測\n- **類別偏好**（Blog / PDF / Research / Transcripts_summary）")
 
+    # 自訂回答指令（在「客製化模式」下生效；其他模式可留空）
+    custom_prompt_tb = gr.Textbox(
+        label="自訂回答指令（客製化模式使用）",
+        placeholder="範例：請用繁體中文、專業且清楚的語氣回答；先列出 3–5 點重點（每點含具體數字/日期），之後用一段話統整影響，最後給出 2 個可行建議。",
+        lines=6
+    )
+
     with gr.Row():
         question = gr.Textbox(label="請輸入問題 / Ask a question",
                               placeholder="例：2024 年 11 月部落格重點？ 或 OPEC 今年減產影響？ 或 台積電股價？",
@@ -4017,7 +4425,7 @@ with gr.Blocks(title="RAG (zh/en) + LLM rerank + Yahoo 新聞\當日股價 + 部
         top_k = gr.Slider(1, 10, value=5, step=1, label="最終 Top K")
 
     mode_sel = gr.Radio(
-        choices=["初學者模式", "專家模式"],
+        choices=["初學者模式", "專家模式", "客製化模式"],
         value="初學者模式",
         label="回答模式（單選）"
     )
@@ -4049,7 +4457,7 @@ with gr.Blocks(title="RAG (zh/en) + LLM rerank + Yahoo 新聞\當日股價 + 部
     with gr.Row():
         context = gr.Markdown(label="📚 引用 Context（含類別與倍率）")
         # queries_md = gr.Textbox(label="🔁 改寫查詢（Multi-queries / 月份模式則隱藏）", lines=10)
-        queries_md = gr.Markdown("### 🔁 改寫查詢（Multi-queries / 月份模式則隱藏）")
+        queries_md = gr.Markdown("### 🔁 改寫查詢（1Multi-queries / 月份模式則隱藏）")
     debug = gr.Textbox(label="🛠 Debug（分數表 / 月份狀態）", lines=12)
     month_state = gr.Markdown("—")
 
@@ -4061,7 +4469,7 @@ with gr.Blocks(title="RAG (zh/en) + LLM rerank + Yahoo 新聞\當日股價 + 部
         except Exception:
             return False
 
-    def wrapped(q, n, k, sb, sp, sr, st, sf, mode, model_name):
+    def wrapped(q, n, k, sb, sp, sr, st, sf, mode, model_name, custom_prompt):
         if _scales_all_zero(sb, sp, sr, st, sf):
             gr.Warning("請至少開啟一種來源（Blog / PDF / Research / Transcript / Filing）。全部為 0 無法檢索。")
             return (gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), None)
@@ -4071,29 +4479,29 @@ with gr.Blocks(title="RAG (zh/en) + LLM rerank + Yahoo 新聞\當日股價 + 部
             return gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), None
 
         final_out, ctx_md, qmd, dbg, dd, month_msg, meta = handle_question(
-            q, n, k, sb, sp, sr, st, sf, mode, model_name   
+            q, n, k, sb, sp, sr, st, sf, mode, model_name, custom_prompt
         )
         return final_out, ctx_md, qmd, dbg, dd, month_msg, meta
 
 
     submit_btn.click(
         fn=wrapped,
-        inputs=[question, top_n, top_k, blog_scale, pdf_scale, research_scale, summary_scale, filing_scale, mode_sel, gen_model_dd],
+        inputs=[question, top_n, top_k, blog_scale, pdf_scale, research_scale, summary_scale, filing_scale, mode_sel, gen_model_dd, custom_prompt_tb],
         outputs=[answer, context, queries_md, debug, followup_dd, month_state, month_meta_state],
     )
     question.submit(
         fn=wrapped,
-        inputs=[question, top_n, top_k, blog_scale, pdf_scale, research_scale, summary_scale, filing_scale, mode_sel, gen_model_dd],
+        inputs=[question, top_n, top_k, blog_scale, pdf_scale, research_scale, summary_scale, filing_scale, mode_sel, gen_model_dd, custom_prompt_tb],
         outputs=[answer, context, queries_md, debug, followup_dd, month_state, month_meta_state],
     )
 
     # 事件綁定需在 Blocks 內容中；用 wrapper 延後引用最終定義的處理函式
-    def _on_followup_wrapper(v, n, k, sb, sp, sr, st, sf, mode, model_name, meta):
-        return on_followup_change(v, n, k, sb, sp, sr, st, sf, mode, model_name, meta)
+    def _on_followup_wrapper(v, n, k, sb, sp, sr, st, sf, mode, model_name, meta, custom_prompt):
+        return on_followup_change(v, n, k, sb, sp, sr, st, sf, mode, model_name, meta, custom_prompt)
 
     followup_dd.change(
         fn=_on_followup_wrapper,
-        inputs=[followup_dd, top_n, top_k, blog_scale, pdf_scale, research_scale, summary_scale, filing_scale, mode_sel, gen_model_dd, month_meta_state],
+        inputs=[followup_dd, top_n, top_k, blog_scale, pdf_scale, research_scale, summary_scale, filing_scale, mode_sel, gen_model_dd, month_meta_state, custom_prompt_tb],
         outputs=[question, answer, context, queries_md, debug, followup_dd, month_state, month_meta_state],
     )
 
