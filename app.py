@@ -25,13 +25,13 @@ from langchain_groq import ChatGroq
 from langchain_core.prompts import PromptTemplate
 
 # ===== 共用：請求器 + 迷你快取 =====
-_REQ_TIMEOUT = 7
+_REQ_TIMEOUT = 3
 def _req_get(
     url: str,
     params: dict = None,
     headers: dict = None,
     timeout: float = _REQ_TIMEOUT,
-    retries: int = 2,
+    retries: int = 1,
     backoff: float = 0.6,
 ):
     base_headers = {
@@ -1405,6 +1405,7 @@ def _resolve_via_yahoo_pipeline(
     fast_mode: bool = False,
     autoc_timeout: Optional[float] = None,
     autoc_max_langs: Optional[int] = None,
+    validate_symbols: bool = True,
 ) -> Optional[str]:
     q_raw = (q_raw or "").strip()
     if not q_raw:
@@ -1428,11 +1429,16 @@ def _resolve_via_yahoo_pipeline(
         ml = _calc_max_langs(lang_seq)
         return yahoo_autoc_all(query, regions=regions, langs=lang_seq, timeout=timeout_val, max_langs=ml)
 
+    def _is_valid(sym: str) -> bool:
+        if not validate_symbols:
+            return True
+        return _is_valid_symbol_cached(sym, lookback_days=30)
+
     # 1) 直接用 autocomplete（多語多區）
     syms = []
     for c in _autoc_candidates(q_raw):
         s = (c.get("symbol") or "").upper()
-        if s and _is_valid_symbol_cached(s, lookback_days=30):
+        if s and _is_valid(s):
             syms.append(s)
     for s in _prefer_tw_first(syms):
         return s
@@ -1446,14 +1452,14 @@ def _resolve_via_yahoo_pipeline(
         syms2 = []
         for c in _autoc_candidates(en_name, langs=("en-US", "zh-TW")):
             s = (c.get("symbol") or "").upper()
-            if s and _is_valid_symbol_cached(s, lookback_days=30):
+            if s and _is_valid(s):
                 syms2.append(s)
         for s in _prefer_tw_first(syms2):
             return s
 
     # 3) LLM 猜 ticker → 逐一驗證（需通過中文名重疊門檻）
     for s in _prefer_tw_first(guess_tickers_via_llm(q_raw, max_n=6)):
-        if not _is_valid_symbol_cached(s, lookback_days=30):
+        if not _is_valid(s):
             continue
 
         ok = False
@@ -1557,6 +1563,7 @@ def resolve_symbol_by_name(
         fast_mode=fast_mode,
         autoc_timeout=autoc_timeout,
         autoc_max_langs=autoc_max_langs,
+        validate_symbols=not fast_mode,
     )
     if sym:
         if is_zh(q_raw):
@@ -1653,13 +1660,31 @@ def resolve_symbol(
 
     # 純代碼樣式
     if re.fullmatch(r"[A-Za-z.]+", s):
-        # 1) 先當作 ticker 試一次
-        if is_valid_symbol(s):
-            return _cache_and_return(s)
-        # 2) 驗證失敗時，不要提前 return；改為落到備援路徑
-        #    直接嘗試 Yahoo Autocomplete（多語、多區域）
+        ticker_candidate = s.upper()
+        is_ticker_like = bool(re.fullmatch(r"[A-Z]{1,6}(?:\.[A-Z]{2,4})?", ticker_candidate))
+        if is_ticker_like and fast_mode:
+            return _cache_and_return(ticker_candidate)
+        if is_ticker_like and not fast_mode:
+            if is_valid_symbol(ticker_candidate):
+                return _cache_and_return(ticker_candidate)
+        autoc_query = ticker_candidate if is_ticker_like else s
+        # fast_mode 下直接依賴 autocomplete；正常模式補 chart 驗證
+        if is_ticker_like and not fast_mode:
+            cands = yahoo_autoc_all(
+                autoc_query,
+                regions=("US","HK","TW"),
+                langs=("en-US","zh-TW","zh-Hant-TW"),
+                timeout=timeout_val,
+                max_langs=max_langs_val,
+            )
+            for c in cands:
+                sym = c.get("symbol")
+                if sym and _is_valid_symbol_cached(sym, lookback_days=30):
+                    return _cache_and_return(sym)
+        # fast_mode 或前面未命中 → 直接依賴 Yahoo autocomplete，多語多區域
+        autoc_query = ticker_candidate if is_ticker_like else s
         cands = yahoo_autoc_all(
-            s,
+            autoc_query,
             regions=("US","HK","TW"),
             langs=("en-US","zh-TW","zh-Hant-TW"),
             timeout=timeout_val,
@@ -1914,7 +1939,15 @@ def format_news_markdown(news: List[dict]) -> str:
     return "\n".join(fmt_one(x) for x in (news or [])) or "Yahoo 暫無相關新聞。"
 
 # ===== 股票 / 新聞 Markdown 區塊的共用組裝器 =====
-def _prepare_stock_md(user_q: str, intents: set, companies: list) -> str:
+def _prepare_stock_md(
+    user_q: str,
+    intents: set,
+    companies: list,
+    *,
+    symbol_cache: Optional[Dict[str, Optional[str]]] = None,
+    quote_cache: Optional[Dict[str, Optional[List[dict]]]] = None,
+    chart_cache: Optional[Dict[str, Optional[dict]]] = None,
+) -> str:
     if "stock" not in intents:
         return ""
 
@@ -1944,10 +1977,18 @@ def _prepare_stock_md(user_q: str, intents: set, companies: list) -> str:
             seen_targets.append(t)
 
     symbols = []
+    cache = symbol_cache if symbol_cache is not None else {}
     for comp in seen_targets[:6]:
-        sym = resolve_symbol(comp, fast_mode=True, autoc_timeout=1.0, autoc_max_langs=2)
+        cache_key = (comp or "").strip().casefold()
+        sym = cache.get(cache_key) if cache_key else None
+        if sym is None and cache_key in cache:
+            continue  # 已知失敗，不重試
+        if sym is None:
+            sym = resolve_symbol(comp, fast_mode=True, autoc_timeout=1.0, autoc_max_langs=2)
         if not sym:
             sym = resolve_symbol(comp, fast_mode=False, autoc_timeout=3.0, autoc_max_langs=3)
+        if symbol_cache is not None and cache_key:
+            symbol_cache[cache_key] = sym
         if sym:
             _remember_resolved_symbol(comp, sym)
             symbols = [sym]  # 只保留第一個解析成功的代號
@@ -1976,13 +2017,28 @@ def _prepare_stock_md(user_q: str, intents: set, companies: list) -> str:
         lines = [format_stock_reply(fetch_stock_price_on_date(sym, date)) for sym in symbols]
     else:
         # 沒指定日期 → 先抓「即時價」，抓不到再退回最近收盤
-        qts = fetch_realtime_quote_batch(symbols, timeout=2.0)
+        sym0 = symbols[0]
+        cached_qts = None
+        if quote_cache is not None:
+            cached_qts = quote_cache.get(sym0)
+        if cached_qts is None:
+            cached_qts = fetch_realtime_quote_batch(symbols, timeout=2.0)
+            if quote_cache is not None:
+                quote_cache[sym0] = cached_qts
+        qts = cached_qts
         if qts:
             lines = [format_realtime_quotes(qts)]
         else:
             lines = []
             for sym in symbols:
-                data = fetch_latest_close_via_chart(sym, lookback_days=7, timeout=4.0)
+                cached_chart = None
+                if chart_cache is not None:
+                    cached_chart = chart_cache.get(sym)
+                if cached_chart is None:
+                    cached_chart = fetch_latest_close_via_chart(sym, lookback_days=7, timeout=4.0)
+                    if chart_cache is not None:
+                        chart_cache[sym] = cached_chart
+                data = cached_chart
                 lines.append(format_stock_reply(data))
 
     # 若仍無任何可用資訊，回覆統一訊息（避免誤導）
@@ -1991,21 +2047,46 @@ def _prepare_stock_md(user_q: str, intents: set, companies: list) -> str:
 
     return "\n".join(lines).strip()
 
-def _prepare_news_md(intents: set, companies: list, user_q: str = "") -> str:
+def _prepare_news_md(
+    intents: set,
+    companies: list,
+    user_q: str = "",
+    *,
+    symbol_cache: Optional[Dict[str, Optional[str]]] = None,
+    news_cache: Optional[Dict[Tuple[Optional[str], Optional[str]], List[dict]]] = None,
+) -> str:
     if "news" not in intents:
         return ""
     targets = (companies or [])[:]
     if not targets:
         targets = guess_companies_from_text(user_q, limit=1)
     sym = None
+    cache = symbol_cache if symbol_cache is not None else {}
     if targets:
-        sym = resolve_symbol(targets[0], fast_mode=True, autoc_timeout=1.0, autoc_max_langs=2)
-        if not sym:
-            sym = resolve_symbol(targets[0], fast_mode=False, autoc_timeout=3.0, autoc_max_langs=3)
+        tok = targets[0]
+        cache_key = (tok or "").strip().casefold()
+        sym = cache.get(cache_key) if cache_key else None
+        if sym is None and cache_key in cache:
+            sym = None
+        else:
+            if sym is None:
+                sym = resolve_symbol(tok, fast_mode=True, autoc_timeout=1.0, autoc_max_langs=2)
+            if not sym:
+                sym = resolve_symbol(tok, fast_mode=False, autoc_timeout=3.0, autoc_max_langs=3)
+            if symbol_cache is not None and cache_key:
+                symbol_cache[cache_key] = sym
         if sym:
-            _remember_resolved_symbol(targets[0], sym)
+            _remember_resolved_symbol(tok, sym)
     kw_for_filter = (targets[0] if targets and re.search(r"[\u4e00-\u9fff]", targets[0]) else None)
-    news = fetch_yahoo_stock_news(sym, max_results=5, company_kw=kw_for_filter)
+    cache_key = (sym, (kw_for_filter or "").casefold() if kw_for_filter else None)
+    cached_news = None
+    if news_cache is not None:
+        cached_news = news_cache.get(cache_key)
+    if cached_news is None:
+        cached_news = fetch_yahoo_stock_news(sym, max_results=5, company_kw=kw_for_filter)
+        if news_cache is not None:
+            news_cache[cache_key] = cached_news
+    news = cached_news
     return format_news_markdown(news)
 
 
@@ -4026,22 +4107,54 @@ def handle_question(user_q: str, top_n: int, top_k: int,
     lead_parts = []
     stock_md_pref = ""
     news_md_pref = ""
+    symbol_cache_local: Dict[str, Optional[str]] = {}
+    quote_cache_local: Dict[str, Optional[List[dict]]] = {}
+    chart_cache_local: Dict[str, Optional[dict]] = {}
+    news_cache_local: Dict[Tuple[Optional[str], Optional[str]], List[dict]] = {}
     need_stock = "stock" in intents_set
     need_news = "news" in intents_set
     if need_stock or need_news:
         with ThreadPoolExecutor(max_workers=2) as pool:
             futures: Dict[str, Any] = {}
             if need_stock:
-                futures["stock"] = pool.submit(_prepare_stock_md, user_q, intents_set, companies)
+                futures["stock"] = pool.submit(
+                    _prepare_stock_md,
+                    user_q,
+                    intents_set,
+                    companies,
+                    symbol_cache=symbol_cache_local,
+                    quote_cache=quote_cache_local,
+                    chart_cache=chart_cache_local,
+                )
             if need_news:
-                futures["news"] = pool.submit(_prepare_news_md, intents_set, companies, user_q)
+                futures["news"] = pool.submit(
+                    _prepare_news_md,
+                    intents_set,
+                    companies,
+                    user_q,
+                    symbol_cache=symbol_cache_local,
+                    news_cache=news_cache_local,
+                )
         if need_stock:
             stock_md_pref = futures["stock"].result()
         if need_news:
             news_md_pref = futures["news"].result()
     if not (need_stock or need_news):
-        stock_md_pref = _prepare_stock_md(user_q, intents_set, companies)
-        news_md_pref = _prepare_news_md(intents_set, companies, user_q)
+        stock_md_pref = _prepare_stock_md(
+            user_q,
+            intents_set,
+            companies,
+            symbol_cache=symbol_cache_local,
+            quote_cache=quote_cache_local,
+            chart_cache=chart_cache_local,
+        )
+        news_md_pref = _prepare_news_md(
+            intents_set,
+            companies,
+            user_q,
+            symbol_cache=symbol_cache_local,
+            news_cache=news_cache_local,
+        )
     if stock_md_pref:
         lead_parts.append("📈 **股票查詢**\n" + stock_md_pref)
     if news_md_pref:
@@ -4175,10 +4288,23 @@ def handle_question(user_q: str, top_n: int, top_k: int,
         else:
             # 月份無候選 → fallback
             parts = []
-            stock_md = _prepare_stock_md(user_q, intents_set, companies)
+            stock_md = _prepare_stock_md(
+                user_q,
+                intents_set,
+                companies,
+                symbol_cache=symbol_cache_local,
+                quote_cache=quote_cache_local,
+                chart_cache=chart_cache_local,
+            )
             if stock_md:
                 parts.append("📈 **股票查詢**\n" + stock_md)
-            news_md = _prepare_news_md(intents_set, companies, user_q)
+            news_md = _prepare_news_md(
+                intents_set,
+                companies,
+                user_q,
+                symbol_cache=symbol_cache_local,
+                news_cache=news_cache_local,
+            )
             if news_md:
                 parts.append("📰 **即時新聞**\n" + news_md)
             parts.append(f"該月份（{start.strftime('%Y-%m')}）未找到**與此主題**相關的文章段落。")
@@ -4245,10 +4371,23 @@ def handle_question(user_q: str, top_n: int, top_k: int,
     if not docs:
         # 沒有候選：給股票/新聞 fallback
         parts = []
-        stock_md = _prepare_stock_md(user_q, intents_set, companies)
+        stock_md = _prepare_stock_md(
+            user_q,
+            intents_set,
+            companies,
+            symbol_cache=symbol_cache_local,
+            quote_cache=quote_cache_local,
+            chart_cache=chart_cache_local,
+        )
         if stock_md:
             parts.append("📈 **股票查詢**\n" + stock_md)
-        news_md = _prepare_news_md(intents_set, companies, user_q)
+        news_md = _prepare_news_md(
+            intents_set,
+            companies,
+            user_q,
+            symbol_cache=symbol_cache_local,
+            news_cache=news_cache_local,
+        )
         if news_md:
             parts.append("📰 **即時新聞**\n" + news_md)
         parts.append("目前找不到可直接回答的內容。可嘗試：放寬條件、改寫關鍵字、或提高類別倍率。")
