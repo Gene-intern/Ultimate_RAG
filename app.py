@@ -8,6 +8,8 @@ import numpy as np
 import torch
 import requests
 from functools import lru_cache
+from concurrent.futures import ThreadPoolExecutor, Future, as_completed
+import threading
 try:
     from rapidfuzz import fuzz  # 可用則使用；不可用時以 None 表示
 except Exception:
@@ -51,6 +53,15 @@ def _req_get(
 
 # 超輕量記憶體快取（TTL 秒）
 _CACHE: Dict[str, Dict[str, Any]] = {}
+_RESOLVE_CACHE_TTL = 1800  # seconds
+_RECENT_RESOLVE_TTL = 1800  # seconds
+
+_RECENT_RESOLVED: Dict[str, Tuple[str, float]] = {}
+_BG_EXECUTOR_LOCK = threading.Lock()
+_BG_EXECUTOR: Optional[ThreadPoolExecutor] = None
+_TW_LOAD_LOCK = threading.Lock()
+_TW_LOAD_FUTURE: Optional[Future] = None
+
 def _cache_get(key: str) -> Optional[Any]:
     it = _CACHE.get(key)
     if not it:
@@ -62,6 +73,68 @@ def _cache_get(key: str) -> Optional[Any]:
 
 def _cache_set(key: str, val: Any, ttl: int = 300) -> None:
     _CACHE[key] = {"val": val, "exp": time.time() + ttl}
+
+
+def _get_bg_executor() -> ThreadPoolExecutor:
+    global _BG_EXECUTOR
+    with _BG_EXECUTOR_LOCK:
+        if _BG_EXECUTOR is None:
+            _BG_EXECUTOR = ThreadPoolExecutor(max_workers=3, thread_name_prefix="rag-bg")
+        return _BG_EXECUTOR
+
+
+def _recent_token_key(token: Optional[str]) -> Optional[str]:
+    if not token:
+        return None
+    norm = _normalize_name(token)
+    norm = norm.strip() if isinstance(norm, str) else ""
+    if norm:
+        return norm.lower()
+    t = (token or "").strip().lower()
+    return t or None
+
+
+def _remember_resolved_symbol(token: Optional[str], symbol: Optional[str]) -> None:
+    if not token or not symbol:
+        return
+    key = _recent_token_key(token)
+    if not key:
+        return
+    _RECENT_RESOLVED[key] = (symbol, time.time())
+    # 也記住 ticker 自身與去掉小數點的形式
+    sym_key = _recent_token_key(symbol)
+    if sym_key:
+        _RECENT_RESOLVED[sym_key] = (symbol, time.time())
+    digits = re.sub(r"\D", "", symbol)
+    if digits:
+        digits_key = digits.lower()
+        _RECENT_RESOLVED[digits_key] = (symbol, time.time())
+
+
+def _lookup_recent_symbol(token: Optional[str]) -> Optional[str]:
+    key = _recent_token_key(token)
+    if not key:
+        return None
+    item = _RECENT_RESOLVED.get(key)
+    if not item:
+        return None
+    sym, ts = item
+    if (time.time() - ts) > _RECENT_RESOLVE_TTL:
+        _RECENT_RESOLVED.pop(key, None)
+        return None
+    return sym
+
+
+def _warm_tw_lists_async(force: bool = False) -> None:
+    global _TW_LOAD_FUTURE
+    fresh = _is_tw_cache_fresh()
+    if fresh and not force:
+        return
+    with _TW_LOAD_LOCK:
+        if _TW_LOAD_FUTURE and not _TW_LOAD_FUTURE.done():
+            return
+        executor = _get_bg_executor()
+        _TW_LOAD_FUTURE = executor.submit(_load_tw_lists, True)
 
 # =========================
 # FAISS 兼容載入
@@ -1274,6 +1347,13 @@ def yahoo_autoc_all(
 # --- TWSE/TPEX 名稱→代號（每日快取） ---
 _TW_CACHE: Dict[str, Any] = {"ts": 0, "by_name": {}, "by_code": {}}
 
+
+def _is_tw_cache_fresh(max_age: float = 24 * 3600) -> bool:
+    if not _TW_CACHE.get("by_name"):
+        return False
+    ts = float(_TW_CACHE.get("ts") or 0)
+    return (time.time() - ts) < max_age
+
 def _normalize_name(name: str) -> str:
     s = (name or "").translate(_ZH_MAP)
     s = re.sub(r"\s+|　+", "", s)
@@ -1319,32 +1399,52 @@ def _load_tw_lists(force: bool=False) -> None:
     _TW_CACHE["by_name"] = by_name
     _TW_CACHE["ts"] = time.time()
 
-def _resolve_via_yahoo_pipeline(q_raw: str) -> Optional[str]:
+def _resolve_via_yahoo_pipeline(
+    q_raw: str,
+    *,
+    fast_mode: bool = False,
+    autoc_timeout: Optional[float] = None,
+    autoc_max_langs: Optional[int] = None,
+) -> Optional[str]:
     q_raw = (q_raw or "").strip()
     if not q_raw:
         return None
 
+    timeout_val = autoc_timeout or (1.2 if fast_mode else 5.0)
+    max_langs_val = autoc_max_langs if autoc_max_langs is not None else (2 if fast_mode else None)
+    default_langs = ("zh-TW", "zh-Hant-TW", "zh-HK", "en-US") if not fast_mode else ("zh-TW", "en-US")
+
     def _prefer_tw_first(cands_syms: list[str]) -> list[str]:
-        # TW/TWO 優先，其次其它
         return sorted(set(cands_syms), key=lambda s: (0 if re.match(r"^\d{4}\.(TW|TWO)$", s.upper()) else 1, len(s)))
 
+    def _calc_max_langs(lang_seq: Iterable[str]) -> Optional[int]:
+        if max_langs_val is None:
+            return None
+        seq = list(lang_seq)
+        return min(len(seq), max_langs_val)
+
+    def _autoc_candidates(query: str, *, regions=("TW", "US", "HK"), langs: Optional[Iterable[str]] = None) -> List[dict]:
+        lang_seq = tuple(langs or default_langs)
+        ml = _calc_max_langs(lang_seq)
+        return yahoo_autoc_all(query, regions=regions, langs=lang_seq, timeout=timeout_val, max_langs=ml)
+
     # 1) 直接用 autocomplete（多語多區）
-    cands = yahoo_autoc_all(q_raw, regions=("TW","US","HK"),
-                            langs=("zh-TW","zh-Hant-TW","en-US"))
     syms = []
-    for c in cands:
+    for c in _autoc_candidates(q_raw):
         s = (c.get("symbol") or "").upper()
         if s and _is_valid_symbol_cached(s, lookback_days=30):
             syms.append(s)
     for s in _prefer_tw_first(syms):
-        return s  # 已驗證過，直接回
+        return s
+
+    if fast_mode:
+        return None
 
     # 2) 英譯再試一次（常見於中文公司名）
     en_name = to_english_company_name(q_raw)
     if en_name:
-        cands2 = yahoo_autoc_all(en_name, regions=("TW","US","HK"), langs=("en-US","zh-TW"))
         syms2 = []
-        for c in cands2:
+        for c in _autoc_candidates(en_name, langs=("en-US", "zh-TW")):
             s = (c.get("symbol") or "").upper()
             if s and _is_valid_symbol_cached(s, lookback_days=30):
                 syms2.append(s)
@@ -1358,16 +1458,14 @@ def _resolve_via_yahoo_pipeline(q_raw: str) -> Optional[str]:
 
         ok = False
 
-        # (a) 台股：用 TW 名單反查中文名做重疊 ≥2 判定
         if re.match(r"^\d{4}\.(TW|TWO)$", s.upper()):
             nm = _tw_find_name_for_code(s) or ""
             if _cjk_overlap_score(q_raw, nm) >= 2:
                 ok = True
 
-        # (b) 其他：用 Yahoo 反查該 symbol 顯示名稱做重疊 ≥2 判定
         if not ok:
-            for c in yahoo_autoc_all(s, regions=("TW","US","HK"), langs=("zh-TW","en-US")):
-                if (c.get("symbol","").upper() == s.upper()):
+            for c in _autoc_candidates(s, langs=("zh-TW", "en-US")):
+                if (c.get("symbol", "").upper() == s.upper()):
                     nm = c.get("name") or ""
                     if _cjk_overlap_score(q_raw, nm) >= 2:
                         ok = True
@@ -1379,17 +1477,15 @@ def _resolve_via_yahoo_pipeline(q_raw: str) -> Optional[str]:
     # 4) 站內搜尋（HTML）→ 二次中文名重疊驗證
     for s in yahoo_search_symbols_by_keyword(q_raw, limit=5):
         ok = False
-        for c in yahoo_autoc_all(s, regions=("TW","US","HK"), langs=("zh-TW","en-US")):
-            if (c.get("symbol","").upper() != s.upper()):
+        for c in _autoc_candidates(s, langs=("zh-TW", "en-US")):
+            if (c.get("symbol", "").upper() != s.upper()):
                 continue
             qn = _normalize_name(q_raw)
-            cn = _normalize_name(c.get("name",""))
-            # 中文字元重疊
+            cn = _normalize_name(c.get("name", ""))
             A = set(re.findall(r"[\u4e00-\u9fff]", qn))
             B = set(re.findall(r"[\u4e00-\u9fff]", cn))
             overlap = len(A & B)
 
-            # 允許使用 rapidfuzz 做一個保險
             sim_ok = False
             if fuzz:
                 try:
@@ -1405,10 +1501,29 @@ def _resolve_via_yahoo_pipeline(q_raw: str) -> Optional[str]:
 
     return None
 
-def resolve_symbol_by_name(name: str) -> Optional[str]:
+def resolve_symbol_by_name(
+    name: str,
+    *,
+    fast_mode: bool = False,
+    autoc_timeout: Optional[float] = None,
+    autoc_max_langs: Optional[int] = None,
+) -> Optional[str]:
     q_raw = (name or "").strip()
     if not q_raw:
         return None
+    timeout_val = autoc_timeout or (1.2 if fast_mode else 5.0)
+    max_langs_val = autoc_max_langs if autoc_max_langs is not None else (2 if fast_mode else None)
+    default_langs = ("zh-TW", "zh-Hant-TW", "en-US") if not fast_mode else ("zh-TW", "en-US")
+
+    def _calc_max_langs(lang_seq: Iterable[str]) -> Optional[int]:
+        if max_langs_val is None:
+            return None
+        return min(len(list(lang_seq)), max_langs_val)
+
+    def _autoc_all(query: str, *, regions=("TW", "US", "HK"), langs: Optional[Iterable[str]] = None) -> List[dict]:
+        lang_seq = tuple(langs or default_langs)
+        ml = _calc_max_langs(lang_seq)
+        return yahoo_autoc_all(query, regions=regions, langs=lang_seq, timeout=timeout_val, max_langs=ml)
     
     # A) 先查持久快取（命中就回，避免重打多個端點）
     hit_rec = _symcache_get_record(q_raw)
@@ -1422,40 +1537,45 @@ def resolve_symbol_by_name(name: str) -> Optional[str]:
             ttl_days = max(1, SYMBOL_MAP_TTL_DAYS)
             revalidate_after = ttl_days * 43200  # 0.5 * 86400
             if age is None or age <= revalidate_after:
+                _remember_resolved_symbol(q_raw, hit)
                 return hit
-            cands = yahoo_autoc_all(q_raw, regions=("TW","US","HK"), langs=("zh-TW","en-US"))
+            cands = _autoc_all(q_raw, regions=("TW","US","HK"), langs=("zh-TW","en-US"))
             syms = { (c.get("symbol") or "").upper() for c in cands }
             _load_tw_lists()
             norm = _normalize_name(q_raw)
             tw_ok = hit.upper() in set((_TW_CACHE.get("by_name") or {}).get(norm, []))
             if hit.upper() in syms or tw_ok:
                 _symcache_put(q_raw, hit)
+                _remember_resolved_symbol(q_raw, hit)
                 return hit
-            # 不一致 → 清除快取並繼續走解析
             _SYM_KV["map"].pop(_sym_norm_key(q_raw), None)
             _symcache_flush()
 
     # B) Yahoo-first
-    sym = _resolve_via_yahoo_pipeline(q_raw)
+    sym = _resolve_via_yahoo_pipeline(
+        q_raw,
+        fast_mode=fast_mode,
+        autoc_timeout=autoc_timeout,
+        autoc_max_langs=autoc_max_langs,
+    )
     if sym:
-        # 若是中文查詢，僅在被佐證時才寫入快取；否則先回傳但不快取（避免污染）
         if is_zh(q_raw):
             ok = False
             if re.match(r"^\d{4}\.(TW|TWO)$", sym.upper()):
                 nm = _tw_find_name_for_code(sym) or ""
                 ok = _cjk_overlap_score(q_raw, nm) >= 2
             if not ok:
-                # 直接用原查詢去 Yahoo，確認這個 symbol 是否就是候選之一
-                for c in yahoo_autoc_all(q_raw, regions=("TW","US","HK"), langs=("zh-TW","en-US")):
-                    if (c.get("symbol","").upper() == sym.upper()):
+                for c in _autoc_all(q_raw, regions=("TW","US","HK"), langs=("zh-TW","en-US")):
+                    if (c.get("symbol", "").upper() == sym.upper()):
                         ok = True
                         break
             if ok:
                 _symcache_put(q_raw, sym)
+                _remember_resolved_symbol(q_raw, sym)
             return sym
         else:
-            # 非中文查詢（英文名/代號）採用原邏輯
             _symcache_put(q_raw, sym)
+            _remember_resolved_symbol(q_raw, sym)
             return sym
 
     # C) 名單冷備援（TWSE/TPEX，只有 Yahoo 全線失敗才用）
@@ -1466,16 +1586,15 @@ def resolve_symbol_by_name(name: str) -> Optional[str]:
     def _bias(s: str) -> float:
         return 2.0 if s.endswith(".TW") else (1.0 if s.endswith(".TWO") else 0.0)
 
-    # C1) 精確
     if q in by_name:
         for s in sorted(by_name[q], key=_bias, reverse=True):
             if _is_valid_symbol_cached(s, lookback_days=30):
-                _symcache_put(q_raw, s); return s
+                _symcache_put(q_raw, s); _remember_resolved_symbol(q_raw, s); return s
 
-    # C2) 前綴/包含
     prefix_pool, contain_pool = [], []
     for k, syms in by_name.items():
-        if k == q: continue
+        if k == q:
+            continue
         if k.startswith(q) or q.startswith(k):
             prefix_pool.extend(syms)
         elif q and (q in k or k in q):
@@ -1484,18 +1603,16 @@ def resolve_symbol_by_name(name: str) -> Optional[str]:
         seen = set()
         for s in sorted((x for x in pool if not (x in seen or seen.add(x))), key=_bias, reverse=True):
             if _is_valid_symbol_cached(s, lookback_days=30):
-                _symcache_put(q_raw, s); return s
+                _symcache_put(q_raw, s); _remember_resolved_symbol(q_raw, s); return s
 
-    # C3) 有序子序列（台積電 ←→ 台灣積體電路製造）
     subs = []
     for k, syms in by_name.items():
         if _ordered_subseq(q, k):
             subs.extend(syms)
     for s in sorted(set(subs), key=_bias, reverse=True):
         if _is_valid_symbol_cached(s, lookback_days=30):
-            _symcache_put(q_raw, s); return s
+            _symcache_put(q_raw, s); _remember_resolved_symbol(q_raw, s); return s
 
-    # D) 全失敗 → None
     return None
 
 def resolve_symbol(
@@ -1505,45 +1622,67 @@ def resolve_symbol(
     autoc_timeout: Optional[float] = None,
     autoc_max_langs: Optional[int] = None,
 ) -> Optional[str]:
-    if not (t or "").strip(): return None
-    s = t.strip()
+    raw = (t or "").strip()
+    if not raw:
+        return None
+    cache_key = f"symres:{raw.lower()}"
+    cached = _cache_get(cache_key)
+    if isinstance(cached, str) and cached:
+        return cached
+
+    s = raw
+    timeout_val = autoc_timeout or (1.2 if fast_mode else 5.0)
+    max_langs_val = autoc_max_langs if autoc_max_langs is not None else (2 if fast_mode else None)
+
+    def _cache_and_return(sym: Optional[str]) -> Optional[str]:
+        if sym:
+            _remember_resolved_symbol(raw, sym)
+            _cache_set(cache_key, sym, _RESOLVE_CACHE_TTL)
+        return sym
 
     # 含中文 → 先走中文名解析
     if re.search(r"[\u4e00-\u9fff]", s):
-        hit = resolve_symbol_by_name(s)
-        if hit: return hit
+        hit = resolve_symbol_by_name(
+            s,
+            fast_mode=fast_mode,
+            autoc_timeout=autoc_timeout,
+            autoc_max_langs=autoc_max_langs,
+        )
+        if hit:
+            return _cache_and_return(hit)
 
     # 純代碼樣式
     if re.fullmatch(r"[A-Za-z.]+", s):
         # 1) 先當作 ticker 試一次
         if is_valid_symbol(s):
-            return s
+            return _cache_and_return(s)
         # 2) 驗證失敗時，不要提前 return；改為落到備援路徑
         #    直接嘗試 Yahoo Autocomplete（多語、多區域）
         cands = yahoo_autoc_all(
             s,
             regions=("US","HK","TW"),
             langs=("en-US","zh-TW","zh-Hant-TW"),
-            timeout=autoc_timeout or 5.0,
-            max_langs=autoc_max_langs,
+            timeout=timeout_val,
+            max_langs=max_langs_val,
         )
         for c in cands:
             sym = c.get("symbol")
             if sym and _is_valid_symbol_cached(sym, lookback_days=30):
-                return sym
+                return _cache_and_return(sym)
         # 3) 最後再用 LLM 猜測幾個 ticker 並驗證
         if not fast_mode:
             for cand in guess_tickers_via_llm(s, max_n=6):
                 if _is_valid_symbol_cached(cand, lookback_days=30):
-                    return cand
+                    return _cache_and_return(cand)
     # 若以上都沒中，才真的回 None（落到函式最後的 return None）
     if re.fullmatch(r"\d{4}", s):
         for suf in (".TW",".TWO"):
             cand = s + suf
-            if is_valid_symbol(cand): return cand
+            if is_valid_symbol(cand):
+                return _cache_and_return(cand)
         return None
     if re.fullmatch(r"\d{4}\.[A-Za-z]{2,4}", s):
-        return s if is_valid_symbol(s) else None
+        return _cache_and_return(s if is_valid_symbol(s) else None)
 
     # Autocomplete 備援（排名器）：統一使用 yahoo_autoc_all，並套用排名器
     for regs in (("TW",), ("US","HK")):
@@ -1551,12 +1690,12 @@ def resolve_symbol(
             s,
             regions=regs,
             langs=("zh-TW","en-US"),
-            timeout=autoc_timeout or 5.0,
-            max_langs=autoc_max_langs,
+            timeout=timeout_val,
+            max_langs=max_langs_val,
         )
         sym = pick_best_yahoo_candidate(s, cands)
         if sym:
-            return sym
+            return _cache_and_return(sym)
     return None
 
 def fetch_latest_close_via_chart(symbol: str, lookback_days: int = 7, timeout: Optional[float] = None) -> Optional[dict]:
@@ -1810,6 +1949,7 @@ def _prepare_stock_md(user_q: str, intents: set, companies: list) -> str:
         if not sym:
             sym = resolve_symbol(comp, fast_mode=False, autoc_timeout=3.0, autoc_max_langs=3)
         if sym:
+            _remember_resolved_symbol(comp, sym)
             symbols = [sym]  # 只保留第一個解析成功的代號
             break
 
@@ -1862,6 +2002,8 @@ def _prepare_news_md(intents: set, companies: list, user_q: str = "") -> str:
         sym = resolve_symbol(targets[0], fast_mode=True, autoc_timeout=1.0, autoc_max_langs=2)
         if not sym:
             sym = resolve_symbol(targets[0], fast_mode=False, autoc_timeout=3.0, autoc_max_langs=3)
+        if sym:
+            _remember_resolved_symbol(targets[0], sym)
     kw_for_filter = (targets[0] if targets and re.search(r"[\u4e00-\u9fff]", targets[0]) else None)
     news = fetch_yahoo_stock_news(sym, max_results=5, company_kw=kw_for_filter)
     return format_news_markdown(news)
@@ -1890,180 +2032,6 @@ def zh2en_query(q: str) -> str:
         return txt
     except Exception:
         return q  # 失敗時直接回原文，後續會有備援
-
-def get_multi_queries_en(base_en_q: str, max_n: int = 4) -> List[str]:
-    if not base_en_q: return []
-    want = max(1, max_n - 1)
-    prompt = (
-        f"Rewrite the following question into {want} semantically similar but phrased-differently English queries. "
-        "Each on its own line, no numbering, no commentary, keep company tickers and numbers unchanged.\n\n"
-        f"{base_en_q}"
-    )
-    try:
-        raw = paraphrase_llm.invoke(prompt).content.strip()
-        lines = [x.strip() for x in raw.split("\n") if x.strip()]
-        uniq, seen = [], set([base_en_q.strip()])
-        for s in lines:
-            if 5 <= len(s) <= 200 and s not in seen:
-                uniq.append(s); seen.add(s)
-            if len(uniq) >= want: break
-        return [base_en_q] + uniq
-    except Exception:
-        return [base_en_q]
-
-# =========================
-# 多查詢改寫
-# =========================
-
-# === Finance intent: dedicated question rewriter (for RAG seeds) ===
-_FINANCE_REWRITE_PROMPT = """
-You are a finance query rewriter for retrieval over company filings (10-K/10-Q/8-K/20-F/6-K) and earnings-call transcripts.
-Return ONLY valid JSON with exactly these keys (no extras):
-{
- "ticker": "<UPPER ticker or null>",
- "company": "<canonical company name or null>",
- "timeframe": {"from":"YYYY|YYYY-Q|null","to":"YYYY|YYYY-Q|null","granularity":"quarter|year"},
- "metrics": ["revenue","eps","gross margin","guidance"],
- "doc_types": ["10-Q","10-K","8-K","20-F","6-K","transcript"],
- "must_have_terms": ["..."],
- "search_queries": ["..."]
-}
-
-Rules:
-- This is a rewrite task; do NOT invent numbers or facts.
-- Normalize metrics to the canonical keys above but EXPAND retrieval vocabulary:
-
-  revenue      ⇒ also search for "net sales", "sales", "net revenue", "total revenue", "total net sales", "turnover".
-  eps          ⇒ also search for "earnings per share", "basic EPS", "diluted EPS".
-  gross margin ⇒ also search for "gross profit margin", "gross profit", "gross margin %".
-  guidance     ⇒ also search for "outlook", "forecast", "targets", "guidance".
-
-- must_have_terms must include: the ticker (if known), company name (if present), and a deduplicated set of the metric synonyms above (lowercase except the ticker).
-
-- search_queries must contain 8–12 compact English queries that mix:
-  • ticker/company + timeframe + metric synonyms; and
-  • likely filing sections: "consolidated statements of operations", "results of operations", "Item 7", "financial statements".
-  At least half of the queries MUST use the synonyms rather than the canonical word
-  (e.g., use "net sales" not only "revenue"; use "earnings per share" not only "EPS").
-  Examples (illustrative only):
-    "AAPL FY2024 net sales consolidated statements of operations 10-K"
-    "Apple 2024 earnings per share results of operations"
-    "AAPL Q3 2024 gross profit margin 10-Q"
-    "Apple outlook transcript FY2024"
-
-- Timeframe rules:
-  • If a specific year is mentioned → granularity="year", from=to=<year>; include "10-K" (or "20-F").
-  • If a specific quarter is mentioned → granularity="quarter" with "YYYY-Q"; include "10-Q" (or "6-K").
-  • If no timeframe → default to last 4 quarters, granularity="quarter".
-
-- Prefer primary filings; include "transcript" when guidance/outlook is asked.
-- Keep everything in English.
-"""
-
-def _safe_list(xs, max_n=8):
-    out, seen = [], set()
-    for s in (xs or []):
-        if not isinstance(s, str): continue
-        t = s.strip()
-        if 3 <= len(t) <= 160 and t not in seen:
-            out.append(t); seen.add(t)
-        if len(out) >= max_n: break
-    return out
-
-def rewrite_finance_query(
-    question: str,
-    *,
-    companies: Optional[List[str]] = None,
-    year_targets: Optional[set[int]] = None,
-    max_queries: int = 8
-) -> Dict[str, Any]:
-    """
-    回傳 dict（至少含 search_queries）；若 LLM 失敗，會走規則式 fallback。
-    """
-    # --- LLM path (strict JSON) ---
-    try:
-        payload = {
-            "question": question,
-            "companies": companies or [],
-            "year_targets": sorted(year_targets) if year_targets else [],
-        }
-        prompt = (
-            _FINANCE_REWRITE_PROMPT +
-            "\nInput:\n" + json.dumps(payload, ensure_ascii=False)
-        )
-        raw = classifier_llm.invoke(prompt).content.strip()
-        obj = extract_json_from_text(raw) or {}
-        ticker = (obj.get("ticker") or "").strip().upper() or None
-        mets   = _safe_list(obj.get("metrics"), max_n=6) or ["revenue","eps","gross margin","guidance"]
-        sq     = _safe_list(obj.get("search_queries"), max_n=max_queries)
-        mht    = _safe_list(obj.get("must_have_terms"), max_n=6)
-        if ticker and ticker not in mht:
-            mht = [ticker] + mht
-        if sq:
-            return {
-                "ticker": ticker,
-                "metrics": mets,
-                "search_queries": sq,
-                "must_have_terms": mht,
-                "timeframe": obj.get("timeframe") or {"from": None, "to": None, "granularity": "quarter"},
-                "doc_types": _safe_list(obj.get("doc_types"), max_n=6) or ["10-Q","10-K","8-K","20-F","6-K","transcript"],
-                "notes": "llm_rewrite"
-            }
-    except Exception:
-        pass
-
-    # --- Heuristic fallback ---
-    yrs = sorted(year_targets) if year_targets else []
-    tk  = None
-    # 盡量從輸入抽一個像樣的 ticker
-    rx = re.findall(r"\b[A-Za-z]{1,6}(?:\.[A-Za-z]{2,4})?\b|\b\d{4}\.[A-Za-z]{2,4}\b", question or "")
-    if rx:
-        tk = rx[0].upper()
-    elif companies:
-        tk = companies[0].upper()
-    mets = ["revenue","eps","gross margin","guidance"]
-    sq: List[str] = []
-    base = (tk + " " if tk else "") + "earnings"
-    if yrs:
-        for y in yrs:
-            sq += [
-                f"{tk+' ' if tk else ''}FY{y} 10-K results",
-                f"{tk+' ' if tk else ''}{y} annual report revenue EPS",
-                f"{tk+' ' if tk else ''}{y} 10-K gross margin guidance",
-            ]
-    else:
-        sq += [
-            f"{tk+' ' if tk else ''}latest 10-Q revenue EPS",
-            f"{tk+' ' if tk else ''}earnings transcript highlights",
-            f"{tk+' ' if tk else ''}management guidance",
-        ]
-    sq = _safe_list(sq, max_n=max_queries)
-    return {
-        "ticker": tk,
-        "metrics": mets,
-        "search_queries": sq or [base],
-        "must_have_terms": [tk] if tk else [],
-        "timeframe": {"from": None, "to": None, "granularity": "quarter"},
-        "doc_types": ["10-Q","10-K","8-K","20-F","6-K","transcript"],
-        "notes": "heuristic_rewrite",
-    }
-
-def get_multi_queries(user_q: str, max_n: int = 5) -> List[str]: 
-    want = max(1, max_n - 1) 
-    prompt = ( 
-        f"請將下列問題改寫成 {want} 句語意相近但不同表述的問句；" 
-        "保持與輸入相同語言（中文用繁體），每句獨立一行，不要任何前後說明或編號：\n\n" 
-        f"{user_q}" 
-    ) 
-    raw = paraphrase_llm.invoke(prompt).content.strip() 
-    lines = [x.strip() for x in raw.split("\n") if x.strip()] 
-    uniq, seen = [], set([user_q.strip()]) 
-    for s in lines: 
-        if 5 <= len(s) <= 200 and not re.search(r"(以下|說明|separated|如下)", s, re.I) and s not in seen: 
-            uniq.append(s); seen.add(s) 
-            if len(uniq) >= want: 
-                break 
-    return [user_q] + uniq
 
 # =========================
 # 檢索（穩定去重 / 先過濾後加權 / 查詢去噪 / 回退節流）
@@ -2249,49 +2217,58 @@ def similarity_search_vectors(
     _lap("retrieval:start")
 
     # --- 中文庫 queries (base) ---
-    zh_queries = get_multi_queries(user_q, max_n=min(5, max(3, k)))
+    zh_seed = (user_q or "").strip()
+    zh_queries = [zh_seed] if zh_seed else []
 
     # --- 英文庫 queries (base) ---
     if is_zh(user_q):
-        base_en = zh2en_query(user_q)
-        en_queries = get_multi_queries_en(base_en, max_n=min(4, max(2, k // 2)))
+        base_en = (zh2en_query(user_q) or "").strip()
+        en_queries = [base_en] if base_en else []
     else:
-        en_queries = get_multi_queries_en(user_q, max_n=min(5, max(3, k)))
+        en_seed = zh_seed
+        en_queries = [en_seed] if en_seed else []
     _lap("retrieval:mk_base_queries")
 
     # 先準備 pin 容器（之後會以較大 cap 合併，避免被裁掉）
     zh_pins: List[str] = []
     en_pins: List[str] = []
 
-    # === 財報意圖：專用改寫 + 釘住英文主種子 / 中文補詞 ===
+    # === 財報意圖：簡單補強關鍵詞 ===
     if intents and ("financial_report" in intents):
-        _lap("retrieval:before_fin_rewrite")
-        finance_plan = rewrite_finance_query(
-            user_q,
-            companies=companies,
-            year_targets=year_targets,
-            max_queries=max(8, k),
-        )
-        _lap("retrieval:after_fin_rewrite")
-
-        fin_en_seeds = list(dict.fromkeys(finance_plan.get("search_queries") or []))[: max(8, k)]
-        if fin_en_seeds:
-            en_pins += fin_en_seeds  # 先放進 pins，稍後合併
-
-        # 依計畫補些中文關鍵詞（ticker/年份/指標）
-        tk   = (finance_plan.get("ticker") or "").strip()
-        mets = (finance_plan.get("metrics") or [])[:4]
-        yrs  = sorted(year_targets) if year_targets else []
-        if tk:
-            zh_pins += [f"{tk} 財報", f"{tk} 季報", f"{tk} 年報"]
+        yrs = sorted(year_targets) if year_targets else []
+        ticker_candidate = None
+        for c in (companies or []):
+            c_clean = (c or "").strip()
+            if not c_clean:
+                continue
+            if re.fullmatch(r"[A-Za-z]{1,6}(?:\.[A-Za-z]{2,4})?", c_clean):
+                ticker_candidate = c_clean.upper()
+                break
+        if ticker_candidate:
+            zh_pins += [
+                f"{ticker_candidate} 財報",
+                f"{ticker_candidate} 季報",
+                f"{ticker_candidate} 年報",
+            ]
+            en_pins += [
+                f"{ticker_candidate} financial report",
+                f"{ticker_candidate} earnings report",
+                f"{ticker_candidate} filing",
+            ]
+        metrics_keywords = ["revenue", "eps", "gross margin", "guidance"]
+        for m in metrics_keywords:
+            if ticker_candidate:
+                en_pins.append(f"{ticker_candidate} {m}")
+            zh_pins.append(f"{m} 財報")
         for y in yrs:
             zh_pins += [f"{y} 年報", f"FY{y} 財報", f"{y} 年 10-K"]
-        for m in mets:
-            zh_pins += ([f"{tk} {m}", f"{m} YoY"] if tk else [f"{m} 財報", f"{m} YoY"])
+            en_pins += [f"FY{y} report", f"{y} annual report", f"{y} 10-K"]
 
     company_info_cache: Dict[str, Dict[str, Any]] = {}
+    company_cache_lock = threading.Lock()
     COMPANY_RESOLVE_BUDGET = 3.0  # 秒，整體公司解析的時間上限
     company_resolve_start = time.perf_counter()
+    needs_precise_symbols = bool((intents or set()) & {"stock", "financial_report", "news"})
 
     def _make_company_info(token: str, sym: Optional[str], needles: Iterable[str], source: str) -> Dict[str, Any]:
         base = (token or "").strip()
@@ -2316,35 +2293,45 @@ def similarity_search_vectors(
             return None
         up = basis.upper()
 
-        # 1) 符號快取命中 → 直接回傳
+        # 1) 最近解析快取
+        recent = _lookup_recent_symbol(basis) or (
+            _lookup_recent_symbol(tok_clean) if tok_clean and tok_clean != basis else None
+        )
+        if recent:
+            return _make_company_info(basis, recent, [basis, recent], source="recent")
+
+        # 2) 符號快取命中 → 直接回傳
         hit = _symcache_get(basis) or (_symcache_get(tok_clean) if tok_clean and tok_clean != basis else None)
         if hit:
             return _make_company_info(basis, hit, [basis, hit], source="cache")
 
-        # 2) 台股公開名單先行匹配
-        _load_tw_lists()
-        by_name = _TW_CACHE.get("by_name") or {}
-        by_code = _TW_CACHE.get("by_code") or {}
-        norm_basis = _normalize_name(basis)
-        tw_syms = list(by_name.get(norm_basis, []))
-        if not tw_syms and tok_clean and tok_clean != basis:
-            tw_syms = list(by_name.get(_normalize_name(tok_clean), []))
-        if tw_syms:
-            sym_pick = tw_syms[0]
-            needles = [basis, tok_clean or basis, sym_pick, sym_pick.split(".")[0]]
-            return _make_company_info(basis, sym_pick, needles, source="twlist")
-        sym_from_code = None
-        if up in by_code:
-            sym_from_code = up
-        elif up + ".TW" in by_code:
-            sym_from_code = up + ".TW"
-        elif up + ".TWO" in by_code:
-            sym_from_code = up + ".TWO"
-        if sym_from_code:
-            needles = [basis, tok_clean or basis, sym_from_code, sym_from_code.split(".")[0]]
-            return _make_company_info(basis, sym_from_code, needles, source="twlist")
+        # 3) 台股公開名單先行匹配（若快取已就緒）
+        tw_ready = _is_tw_cache_fresh()
+        if not tw_ready:
+            _warm_tw_lists_async()
+        by_name = _TW_CACHE.get("by_name") if tw_ready else {}
+        by_code = _TW_CACHE.get("by_code") if tw_ready else {}
+        if by_name and by_code:
+            norm_basis = _normalize_name(basis)
+            tw_syms = list(by_name.get(norm_basis, []))
+            if not tw_syms and tok_clean and tok_clean != basis:
+                tw_syms = list(by_name.get(_normalize_name(tok_clean), []))
+            if tw_syms:
+                sym_pick = tw_syms[0]
+                needles = [basis, tok_clean or basis, sym_pick, sym_pick.split(".")[0]]
+                return _make_company_info(basis, sym_pick, needles, source="twlist")
+            sym_from_code = None
+            if up in by_code:
+                sym_from_code = up
+            elif up + ".TW" in by_code:
+                sym_from_code = up + ".TW"
+            elif up + ".TWO" in by_code:
+                sym_from_code = up + ".TWO"
+            if sym_from_code:
+                needles = [basis, tok_clean or basis, sym_from_code, sym_from_code.split(".")[0]]
+                return _make_company_info(basis, sym_from_code, needles, source="twlist")
 
-        # 3) 直接判斷是否為 ticker / 代碼，避免立即打外部 API
+        # 4) 直接判斷是否為 ticker / 代碼，避免立即打外部 API
         if re.fullmatch(r"[A-Za-z]{1,6}(?:\.[A-Za-z]{2,4})?", up):
             return _make_company_info(basis, up, [up], source="fast")
         if re.fullmatch(r"\d{4}(?:\.[A-Za-z]{2,4})?", up):
@@ -2354,7 +2341,7 @@ def similarity_search_vectors(
             needles = [tw_sym, up + ".TWO", up]
             return _make_company_info(basis, tw_sym, needles, source="fast")
 
-        # 4) fallback：至少保留原字串作為 needle
+        # 5) fallback：至少保留原字串作為 needle
         return _make_company_info(basis, None, [basis], source="fast")
 
     def _canonicalize_company_info(basis: str, seed: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -2369,26 +2356,31 @@ def similarity_search_vectors(
             merged_needles.update(seed.get("needles") or [])
         merged_needles.add(basis.lower())
         sym_final = sym or ((seed or {}).get("sym"))
+        if sym_final:
+            _remember_resolved_symbol(basis, sym_final)
         return _make_company_info((seed or {}).get("token") or basis, sym_final, merged_needles, source="slow")
 
-    def _get_company_info(raw_token: str) -> Optional[Dict[str, Any]]:
+    def _get_company_info(raw_token: str, allow_slow: bool = True) -> Optional[Dict[str, Any]]:
         tok = (raw_token or "").strip()
         if not tok:
             return None
         tok_clean = clean_company_token(tok, original_text=user_q)
         key = tok_clean or tok
-        cached = company_info_cache.get(key)
+        with company_cache_lock:
+            cached = company_info_cache.get(key)
         if cached:
             return cached
 
         info_fast = _heuristic_company_info(tok, tok_clean)
         if info_fast:
-            company_info_cache[key] = info_fast
+            with company_cache_lock:
+                company_info_cache[key] = info_fast
         else:
             info_fast = _make_company_info(tok_clean or tok, None, [tok_clean or tok], source="fast")
-            company_info_cache[key] = info_fast
+            with company_cache_lock:
+                company_info_cache[key] = info_fast
 
-        if info_fast.get("sym"):
+        if info_fast.get("sym") or not allow_slow:
             return info_fast
 
         if (time.perf_counter() - company_resolve_start) > COMPANY_RESOLVE_BUDGET:
@@ -2399,17 +2391,51 @@ def similarity_search_vectors(
             return info_fast
         info_slow = _canonicalize_company_info(basis, info_fast)
         if info_slow:
-            company_info_cache[key] = info_slow
+            with company_cache_lock:
+                company_info_cache[key] = info_slow
             return info_slow
         return info_fast
+
+    company_tokens = [c for c in (companies or []) if str(c).strip()]
+    allow_slow_companies = needs_precise_symbols
+    company_infos_by_token: Dict[str, Optional[Dict[str, Any]]] = {}
+    if company_tokens:
+        _warm_tw_lists_async()
+        if len(company_tokens) > 1:
+            max_workers = min(4, len(company_tokens))
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                futures = {
+                    pool.submit(_get_company_info, tok, allow_slow_companies): (idx, tok)
+                    for idx, tok in enumerate(company_tokens)
+                }
+                interim: Dict[int, Optional[Dict[str, Any]]] = {}
+                for fut in as_completed(futures):
+                    idx, tok = futures[fut]
+                    try:
+                        interim[idx] = fut.result()
+                    except Exception:
+                        interim[idx] = None
+                for idx, tok in enumerate(company_tokens):
+                    company_infos_by_token[tok] = interim.get(idx)
+        else:
+            for tok in company_tokens:
+                company_infos_by_token.setdefault(
+                    tok,
+                    _get_company_info(tok, allow_slow=allow_slow_companies),
+                )
 
     # ====== 法說會題：強化查詢（公司名＋代碼） ======
     ec = is_earnings_call_query(user_q)
     if ec:
         targets = [c for c in (companies or [])[:1] if str(c).strip()]
         for tok in targets:
-            info = _get_company_info(tok)
+            info = company_infos_by_token.get(tok)
+            if info is None:
+                info = _get_company_info(tok, allow_slow=allow_slow_companies)
+                company_infos_by_token[tok] = info
             sym = (info or {}).get("sym") or ""
+            if sym:
+                _remember_resolved_symbol(tok, sym)
             num = re.sub(r"\D", "", sym) if sym else ""  # 例如 3416
             # 中文 pins
             zh_pins += [
@@ -2432,14 +2458,18 @@ def similarity_search_vectors(
     # === 依公司加強（把公司 alias/ticker 直接當查詢詞） ===
     comp_needles: Set[str] = set()
     resolved_syms: List[str] = []
-    for tok in (companies or []):
-        info = _get_company_info(tok)
+    for tok in company_tokens:
+        info = company_infos_by_token.get(tok)
+        if info is None and allow_slow_companies:
+            info = _get_company_info(tok, allow_slow=allow_slow_companies)
+            company_infos_by_token[tok] = info
         if not info:
             continue
         comp_needles.update(info.get("needles") or ())
         sym = info.get("sym")
         if sym:
             resolved_syms.append(sym)
+            _remember_resolved_symbol(tok, sym)
 
     if resolved_syms:
         resolved_syms = list(dict.fromkeys(resolved_syms))
@@ -3976,11 +4006,12 @@ def handle_question(user_q: str, top_n: int, top_k: int,
     # === 問題解析 ===
     is_month, month_rng = is_whole_month_query(user_q)
     intents, companies = classify_intents_and_companies(user_q)
+    intents_set = set(intents)
     requested_years = extract_report_year_targets(user_q) if ("financial_report" in intents) else set()
     wants_latest = bool(re.search(r"(最新|最近|近況|未來)", user_q))
     _lap("parse")
 
-    if ("concept" in set(intents)) or ("industry" in set(intents)):
+    if ("concept" in intents_set) or ("industry" in intents_set):
         type_scales = {**type_scales}
         type_scales["blog"] = max(type_scales.get("blog", 1.0), 1.5)
         type_scales["research"] = max(type_scales.get("research", 1.0), 1.0)
@@ -3988,15 +4019,31 @@ def handle_question(user_q: str, top_n: int, top_k: int,
         type_scales["filing"] = min(type_scales.get("filing", 1.0), 0.3)
 
     # 若是財報且有指定公司，但使用者把 filing 拉到 0，避免 prefilter 清空
-    if ("financial_report" in intents) and companies and type_scales.get("filing", 0.0) <= 0.0:
+    if ("financial_report" in intents_set) and companies and type_scales.get("filing", 0.0) <= 0.0:
         type_scales["filing"] = 0.1
 
     # 準備：若包含股價/新聞意圖，先產生可前置的區塊
     lead_parts = []
-    stock_md_pref = _prepare_stock_md(user_q, intents, companies)
+    stock_md_pref = ""
+    news_md_pref = ""
+    need_stock = "stock" in intents_set
+    need_news = "news" in intents_set
+    if need_stock or need_news:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures: Dict[str, Any] = {}
+            if need_stock:
+                futures["stock"] = pool.submit(_prepare_stock_md, user_q, intents_set, companies)
+            if need_news:
+                futures["news"] = pool.submit(_prepare_news_md, intents_set, companies, user_q)
+        if need_stock:
+            stock_md_pref = futures["stock"].result()
+        if need_news:
+            news_md_pref = futures["news"].result()
+    if not (need_stock or need_news):
+        stock_md_pref = _prepare_stock_md(user_q, intents_set, companies)
+        news_md_pref = _prepare_news_md(intents_set, companies, user_q)
     if stock_md_pref:
         lead_parts.append("📈 **股票查詢**\n" + stock_md_pref)
-    news_md_pref = _prepare_news_md(set(intents), companies, user_q)
     if news_md_pref:
         lead_parts.append("📰 **即時新聞**\n" + news_md_pref)
     _lap("yahoo_blocks")
@@ -4034,7 +4081,7 @@ def handle_question(user_q: str, top_n: int, top_k: int,
             k=max(12, top_n),
             type_scales=type_scales,
             prefilter=True,
-            intents=set(intents),
+            intents=intents_set,
             year_targets=requested_years,
             strict_year=True,
             companies=companies,
@@ -4091,7 +4138,6 @@ def handle_question(user_q: str, top_n: int, top_k: int,
                     # 內部檢索節點
                     "retrieval:start",
                     "retrieval:mk_base_queries",
-                    "retrieval:before_fin_rewrite", "retrieval:after_fin_rewrite",
                     "retrieval:merged_pins_base",
                     "retrieval:before_alias_expand", "retrieval:after_alias_expand",
                     "retrieval:queries_ready",
@@ -4129,10 +4175,10 @@ def handle_question(user_q: str, top_n: int, top_k: int,
         else:
             # 月份無候選 → fallback
             parts = []
-            stock_md = _prepare_stock_md(user_q, intents, companies)
+            stock_md = _prepare_stock_md(user_q, intents_set, companies)
             if stock_md:
                 parts.append("📈 **股票查詢**\n" + stock_md)
-            news_md = _prepare_news_md(set(intents), companies, user_q)
+            news_md = _prepare_news_md(intents_set, companies, user_q)
             if news_md:
                 parts.append("📰 **即時新聞**\n" + news_md)
             parts.append(f"該月份（{start.strftime('%Y-%m')}）未找到**與此主題**相關的文章段落。")
@@ -4148,7 +4194,6 @@ def handle_question(user_q: str, top_n: int, top_k: int,
                     "set_llm", "parse", "yahoo_blocks",
                     "retrieval:start",
                     "retrieval:mk_base_queries",
-                    "retrieval:before_fin_rewrite", "retrieval:after_fin_rewrite",
                     "retrieval:merged_pins_base",
                     "retrieval:before_alias_expand", "retrieval:after_alias_expand",
                     "retrieval:queries_ready",
@@ -4189,7 +4234,7 @@ def handle_question(user_q: str, top_n: int, top_k: int,
         k=max(12, top_n),
         type_scales=type_scales,
         prefilter=True,
-        intents=set(intents),
+        intents=intents_set,
         year_targets=requested_years,
         strict_year=True,
         companies=companies,
@@ -4200,10 +4245,10 @@ def handle_question(user_q: str, top_n: int, top_k: int,
     if not docs:
         # 沒有候選：給股票/新聞 fallback
         parts = []
-        stock_md = _prepare_stock_md(user_q, intents, companies)
+        stock_md = _prepare_stock_md(user_q, intents_set, companies)
         if stock_md:
             parts.append("📈 **股票查詢**\n" + stock_md)
-        news_md = _prepare_news_md(set(intents), companies, user_q)
+        news_md = _prepare_news_md(intents_set, companies, user_q)
         if news_md:
             parts.append("📰 **即時新聞**\n" + news_md)
         parts.append("目前找不到可直接回答的內容。可嘗試：放寬條件、改寫關鍵字、或提高類別倍率。")
@@ -4222,7 +4267,6 @@ def handle_question(user_q: str, top_n: int, top_k: int,
                 "set_llm", "parse", "yahoo_blocks",
                 "retrieval:start",
                 "retrieval:mk_base_queries",
-                "retrieval:before_fin_rewrite", "retrieval:after_fin_rewrite",
                 "retrieval:merged_pins_base",
                 "retrieval:before_alias_expand", "retrieval:after_alias_expand",
                 "retrieval:queries_ready",
@@ -4295,7 +4339,6 @@ def handle_question(user_q: str, top_n: int, top_k: int,
             # 內部檢索節點
             "retrieval:start",
             "retrieval:mk_base_queries",
-            "retrieval:before_fin_rewrite", "retrieval:after_fin_rewrite",
             "retrieval:merged_pins_base",
             "retrieval:before_alias_expand", "retrieval:after_alias_expand",
             "retrieval:queries_ready",
