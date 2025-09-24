@@ -4499,8 +4499,7 @@ with gr.Blocks(title="RAG (zh/en) + LLM rerank + Yahoo 新聞\當日股價 + 部
     answer = gr.Markdown(label="🧠 回答 / Answer")
     with gr.Row():
         context = gr.Markdown(label="📚 引用 Context（含類別與倍率）")
-        # queries_md = gr.Textbox(label="🔁 改寫查詢（Multi-queries / 月份模式則隱藏）", lines=10)
-        queries_md = gr.Markdown("### 🔁 改寫查詢（1Multi-queries / 月份模式則隱藏）")
+        queries_md = gr.Markdown(label="🔁 查詢紀錄（Multi-queries / 月份模式則隱藏）")
     debug = gr.Textbox(label="🛠 Debug（分數表 / 月份狀態）", lines=12)
     month_state = gr.Markdown("—")
 
